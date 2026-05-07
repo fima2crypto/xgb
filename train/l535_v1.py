@@ -42,6 +42,8 @@ SELECT *
 FROM {TABLE_NAME}
 ORDER BY ky ASC
 """
+
+print(sql)
 df = pd.read_sql(sql, engine)
 
 
@@ -49,7 +51,7 @@ print("Rows loaded:", len(df))
 
 # ==========================================================
 # CLEAN
-# ==========================================================
+# ======rm .git/index====================================================
 for c in ["ky", "n1", "n2", "n3", "n4", "n5", "n6"]:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
