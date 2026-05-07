@@ -43,7 +43,7 @@ FROM {TABLE_NAME}
 ORDER BY ky ASC
 """
 
-print(sql)
+print("hung")
 df = pd.read_sql(sql, engine)
 
 
