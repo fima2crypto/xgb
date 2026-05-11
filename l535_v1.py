@@ -9,7 +9,11 @@ import numpy as np
 
 from xgboost import XGBClassifier
 
-from core.database import get_engine
+import json
+
+from itertools import combinations
+
+from core.database import get_engine,get_db
 
 # ==========================================================
 # CONFIG
@@ -21,8 +25,8 @@ WINDOW = 30
 TOTAL_MAIN = 35
 TOTAL_BONUS = 12
 
-TOP_MAIN = 10
-TOP_BONUS = 3
+#TOP_MAIN = 10
+#TOP_BONUS = 3
 
 BACKTEST_LAST = 100
 
@@ -30,6 +34,11 @@ BACKTEST_LAST = 100
 W_XGB = 0.55
 W_FREQ = 0.25
 W_DELAY = 0.20
+
+TOP_POOL_MAIN = 8
+TOP_POOL_BONUS = 3
+
+FINAL_TOP_SET = 5
 
 # ==========================================================
 # LOAD DATA
@@ -43,7 +52,11 @@ FROM {TABLE_NAME}
 ORDER BY ky ASC
 """
 
-print("hung1")
+print("\n")
+print("=" * 60)
+print("   @fima predict Lotto 5/35 - Powered by XGBoost")
+print("=" * 60)
+
 df = pd.read_sql(sql, engine)
 
 
@@ -398,32 +411,161 @@ bonus_probs = sorted(
 # ==========================================================
 # FINAL RESULT
 # ==========================================================
-print("\nTOP MAIN")
+# ==========================================================
+# GENERATE TOP COMBINATIONS
+# ==========================================================
+top_main_pool = ranks[:TOP_POOL_MAIN]
+
+main_score_map = {
+    n: s
+    for n, s in top_main_pool
+}
+
+main_numbers = [
+    n
+    for n, _ in top_main_pool
+]
+
+bonus_numbers = [
+    n
+    for n, _ in bonus_probs[:TOP_POOL_BONUS]
+]
+
+combo_results = []
+
+# ----------------------------------------------------------
+# BUILD COMBINATIONS
+# ----------------------------------------------------------
+for combo in combinations(main_numbers, 5):
+
+    combo = sorted(combo)
+
+    score = sum(
+        main_score_map[n]
+        for n in combo
+    ) / 5
+
+    for bonus in bonus_numbers:
+
+        combo_results.append({
+            "main": combo,
+            "bonus": int(bonus),
+            "score": round(float(score), 6)
+        })
+
+# ----------------------------------------------------------
+# SORT
+# ----------------------------------------------------------
+combo_results = sorted(
+    combo_results,
+    key=lambda x: x["score"],
+    reverse=True
+)
+
+final_sets = combo_results[:FINAL_TOP_SET]
+
+# ==========================================================
+# PRINT RESULT
+# ==========================================================
+print(f"\nTOP {TOP_POOL_MAIN} MAIN")
 print("-" * 60)
 
-for n, s in ranks[:TOP_MAIN]:
+for n, s in top_main_pool:
 
     print(f"{n:02d} => {s:.4f}")
 
-pick = sorted([
-    x[0]
-    for x in ranks[:5]
-])
-
-print("\nGOI Y BO MAIN:")
-
-print(
-    " ".join(
-        f"{x:02d}"
-        for x in pick
-    )
-)
-
-print("\nTOP BONUS")
+print(f"\nTOP {TOP_POOL_BONUS}BONUS")
 print("-" * 60)
 
-for n, p in bonus_probs[:TOP_BONUS]:
+for n, p in bonus_probs[:TOP_POOL_BONUS]:
 
     print(f"{n:02d} => {p:.4f}")
+
+print("\nTOP GENERATED SETS")
+print("-" * 60)
+
+for idx, row in enumerate(final_sets, start=1):
+
+    main_str = " ".join(
+        f"{x:02d}"
+        for x in row["main"]
+    )
+
+    print(
+        f"#{idx} | "
+        f"{main_str} | "
+        f"BONUS {row['bonus']:02d} | "
+        f"SCORE={row['score']}"
+    )
+
+# ==========================================================
+# SAVE TO DB
+# ==========================================================
+conn = get_db()
+
+cursor = conn.cursor()
+
+try:
+
+    ky_ref = int(df.iloc[-1]["ky"])
+
+    predict_main_json = [
+        {
+            "number": int(n),
+            "score": float(round(s, 6))
+        }
+        for n, s in top_main_pool
+    ]
+
+    predict_bonus_json = [
+        {
+            "number": int(n),
+            "score": float(round(p, 6))
+        }
+        for n, p in bonus_probs[:TOP_POOL_BONUS]
+    ]
+
+    final_sets_json = []
+
+    for row in final_sets:
+
+        final_sets_json.append({
+            "main": [int(x) for x in row["main"]],
+            "bonus": int(row["bonus"]),
+            "score": float(row["score"])
+        })
+
+    cursor.execute(
+        """
+        INSERT INTO l535kqtrain (
+            ky_ref,
+            predict_main,
+            predict_bonus,
+            final_sets
+        )
+        VALUES (%s, %s, %s, %s)
+        """,
+        (
+            ky_ref,
+            json.dumps(predict_main_json),
+            json.dumps(predict_bonus_json),
+            json.dumps(final_sets_json)
+        )
+    )
+
+    conn.commit()
+
+    print("\n✅ SAVED TO l535kqtrain")
+
+except Exception as e:
+
+    conn.rollback()
+
+    print("\n❌ SAVE ERROR:", e)
+
+finally:
+
+    cursor.close()
+    conn.close()
 
 print("=" * 60)
