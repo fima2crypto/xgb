@@ -261,36 +261,10 @@ def make_xgb(n_cls, params: dict = None):
 
 
 # ─────────────────────────────────────────────
-# 5. WALK-FORWARD VALIDATION
+# 5. TRAIN
 # ─────────────────────────────────────────────
 
-def _walk_forward_splits(n: int, min_train: int, val_size: int):
-    """
-    Tao cac (train_idx, val_idx) theo kieu expanding window.
-    - min_train : so ky toi thieu de bat dau train
-    - val_size  : so ky moi fold validation (rolling window nho)
-    Tra ve list cac (tr_idx, va_idx).
-    """
-    splits = []
-    start  = min_train
-    while start + val_size <= n:
-        tr_idx = np.arange(0, start)
-        va_idx = np.arange(start, start + val_size)
-        splits.append((tr_idx, va_idx))
-        start += val_size
-    return splits
-
-
-def train(df, feature_cols, n_splits=5, val_size=20,
-          min_train=200, xgb_params=None):
-    """
-    Train voi Walk-Forward Validation (expanding window).
-
-    Tham so:
-      val_size  : so ky moi window validation (mac dinh 20)
-      min_train : so ky toi thieu de bat dau (mac dinh 200)
-      n_splits  : chi dung khi val_size=0 (fallback TimeSeriesSplit)
-    """
+def train(df, feature_cols, n_splits=5, xgb_params=None):
     X     = df[feature_cols].values
     y_raw = df["dd"].values
 
@@ -312,34 +286,22 @@ def train(df, feature_cols, n_splits=5, val_size=20,
     )
     print(f"  Baseline (majority='{maj_lbl}'): {baseline:.3f}")
 
-    # Chon walk-forward hoac TimeSeriesSplit
-    if val_size > 0:
-        splits = _walk_forward_splits(len(X), min_train, val_size)
-        print(
-            f"  Walk-forward: min_train={min_train}, val_size={val_size}"
-            f"  → {len(splits)} folds"
-        )
-    else:
-        tscv   = TimeSeriesSplit(n_splits=n_splits)
-        splits = list(tscv.split(X))
-        print(f"  TimeSeriesSplit: {n_splits} folds")
-
+    tscv     = TimeSeriesSplit(n_splits=n_splits)
     acc_list = []
-    for fold, (tr_idx, va_idx) in enumerate(splits, 1):
+
+    for fold, (tr_idx, va_idx) in enumerate(tscv.split(X), 1):
         X_tr, X_va = X[tr_idx], X[va_idx]
         y_tr, y_va = y[tr_idx], y[va_idx]
 
-        # 1. Class weights
-        sw_tr    = compute_sample_weight("balanced", y_tr)
+        # 1. Class weights — can bang theo tan suat tung lop trong fold
+        sw_tr = compute_sample_weight("balanced", y_tr)
+
         fold_cls = sorted(set(y_tr))
         remap    = {old: new for new, old in enumerate(fold_cls)}
         y_tr_r   = np.array([remap[v] for v in y_tr])
         mask     = np.array([v in remap for v in y_va])
         y_va_r   = np.array([remap[v] for v in y_va if v in remap])
         X_va_r   = X_va[mask]
-
-        if len(y_va_r) == 0:
-            continue
 
         mdl = make_xgb(len(fold_cls), xgb_params)
         # 2. Early stopping tren validation set
@@ -349,46 +311,28 @@ def train(df, feature_cols, n_splits=5, val_size=20,
             eval_set=[(X_va_r, y_va_r)],
             verbose=False,
         )
-        acc     = accuracy_score(y_va_r, mdl.predict(X_va_r))
-        best_it = getattr(mdl, "best_iteration", "-")
+        acc      = accuracy_score(y_va_r, mdl.predict(X_va_r))
+        best_it  = getattr(mdl, "best_iteration", "-")
         acc_list.append(acc)
+        print(
+            f"    Fold {fold}: acc={acc:.3f}  best_iter={best_it}"
+            f"  (val={len(y_va_r)}, "
+            f"ky {df['ky'].iloc[va_idx[0]]}→{df['ky'].iloc[va_idx[-1]]})"
+        )
 
-        # In moi 5 fold de khong spam qua nhieu
-        if fold % 5 == 0 or fold <= 3 or fold == len(splits):
-            print(
-                f"    Fold {fold:>3}: acc={acc:.3f}  best_iter={best_it:>4}"
-                f"  train={len(tr_idx)}  val={len(y_va_r)}"
-                f"  ky {df['ky'].iloc[va_idx[0]]}→{df['ky'].iloc[va_idx[-1]]}"
-            )
-
-    mean_acc = float(np.mean(acc_list))
-    std_acc  = float(np.std(acc_list))
+    mean_acc = np.mean(acc_list)
     lift     = mean_acc - baseline
     flag     = "✅ tot" if lift > 0.05 else ("🟡 kha" if lift > 0.01 else "⚠️ yeu")
     print(
-        f"\n  WF acc = {mean_acc:.3f} ± {std_acc:.3f}  "
+        f"\n  CV acc = {mean_acc:.3f} ± {np.std(acc_list):.3f}  "
         f"| lift = {lift:+.3f}  {flag}"
-        f"  ({len(acc_list)} folds)"
     )
-
-    # Phan tich acc theo thoi gian — chia lam 3 giai doan
-    n_f = len(acc_list)
-    if n_f >= 6:
-        t1 = acc_list[:n_f//3]
-        t2 = acc_list[n_f//3: 2*n_f//3]
-        t3 = acc_list[2*n_f//3:]
-        print(
-            f"  Acc theo giai doan: "
-            f"dau={np.mean(t1):.3f}  "
-            f"giua={np.mean(t2):.3f}  "
-            f"cuoi={np.mean(t3):.3f}"
-        )
 
     # Final model tren toan bo data (tat early stopping)
     final_p = dict(xgb_params or {})
     final_p["early_stopping_rounds"] = None
-    final  = make_xgb(n_classes, final_p)
-    sw_all = compute_sample_weight("balanced", y)
+    final   = make_xgb(n_classes, final_p)
+    sw_all  = compute_sample_weight("balanced", y)
     final.fit(X, y, sample_weight=sw_all, verbose=False)
 
     # Report 20% cuoi
@@ -409,8 +353,8 @@ def train(df, feature_cols, n_splits=5, val_size=20,
 # 6. OPTUNA TUNING
 # ─────────────────────────────────────────────
 
-def optuna_tune(df, feature_cols, val_size=20, min_train=200, n_trials=50):
-    """5. Tim hyperparameter tot nhat bang Optuna + Walk-Forward."""
+def optuna_tune(df, feature_cols, n_splits=5, n_trials=50):
+    """5. Tim hyperparameter tot nhat bang Optuna."""
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -422,7 +366,7 @@ def optuna_tune(df, feature_cols, val_size=20, min_train=200, n_trials=50):
     y_raw = df["dd"].values
     le    = LabelEncoder()
     y     = le.fit_transform(y_raw)
-    splits = _walk_forward_splits(len(X), min_train, val_size)
+    tscv  = TimeSeriesSplit(n_splits=n_splits)
 
     def objective(trial):
         params = dict(
@@ -438,7 +382,7 @@ def optuna_tune(df, feature_cols, val_size=20, min_train=200, n_trials=50):
             early_stopping_rounds = 30,
         )
         acc_list = []
-        for tr_idx, va_idx in splits:
+        for tr_idx, va_idx in tscv.split(X):
             X_tr, X_va = X[tr_idx], X[va_idx]
             y_tr, y_va = y[tr_idx], y[va_idx]
 
@@ -450,8 +394,6 @@ def optuna_tune(df, feature_cols, val_size=20, min_train=200, n_trials=50):
             y_va_r   = np.array([remap[v] for v in y_va if v in remap])
             X_va_r   = X_va[mask]
 
-            if len(y_va_r) == 0:
-                continue
             mdl = make_xgb(len(fold_cls), params)
             mdl.fit(
                 X_tr, y_tr_r,
@@ -460,17 +402,14 @@ def optuna_tune(df, feature_cols, val_size=20, min_train=200, n_trials=50):
                 verbose=False,
             )
             acc_list.append(accuracy_score(y_va_r, mdl.predict(X_va_r)))
-        return np.mean(acc_list) if acc_list else 0.0
+        return np.mean(acc_list)
 
-    print(
-        f"\n🔍 Optuna tuning ({n_trials} trials, "
-        f"walk-forward val_size={val_size}, {len(splits)} folds)..."
-    )
+    print(f"\n🔍 Optuna tuning ({n_trials} trials, {n_splits} folds)...")
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_params
-    print(f"\n  Best WF acc : {study.best_value:.3f}")
+    print(f"\n  Best CV acc : {study.best_value:.3f}")
     print("  Best params :")
     for k, v in best.items():
         print(f"    {k:<25} = {v}")
@@ -544,12 +483,7 @@ def main():
     parser.add_argument("--n_ky",        type=int,  default=0)
     parser.add_argument("--qh_ky",       type=int,  default=20)
     parser.add_argument("--lags",        type=int,  default=3)
-    parser.add_argument("--splits",      type=int,  default=5,
-                        help="So folds TimeSeriesSplit (chi dung khi --val_size 0)")
-    parser.add_argument("--val_size",    type=int,  default=20,
-                        help="So ky moi fold walk-forward (0 = dung TimeSeriesSplit)")
-    parser.add_argument("--min_train",   type=int,  default=200,
-                        help="So ky toi thieu de bat dau train (mac dinh: 200)")
+    parser.add_argument("--splits",      type=int,  default=5)
     parser.add_argument("--importance",  action="store_true")
     parser.add_argument("--tune",        action="store_true",
                         help="Chay Optuna hyperparameter tuning truoc khi train")
@@ -591,8 +525,7 @@ def main():
     if args.tune:
         xgb_params = optuna_tune(
             df_feat, feature_cols,
-            val_size=args.val_size,
-            min_train=args.min_train,
+            n_splits=args.splits,
             n_trials=args.tune_trials,
         )
 
@@ -600,8 +533,6 @@ def main():
     model, le, cv_acc = train(
         df_feat, feature_cols,
         n_splits=args.splits,
-        val_size=args.val_size,
-        min_train=args.min_train,
         xgb_params=xgb_params,
     )
 
