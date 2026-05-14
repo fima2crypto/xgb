@@ -42,10 +42,10 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres:bin@localhost:5432/katalott"
 )
 
-ALL_NUMS = list(range(1, 36))   # 1-35
+ALL_NUMS = list(range(1, 36))  # 1-35
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION     = "v1.3.0"
+VERSION = "v1.3.0"
 DESCRIPTION = (
     "35 binary XGBoost (n1-n5), no-leak train/predict split, "
     "sliding window + time decay weight, Mega/Power cross features, "
@@ -56,8 +56,10 @@ DESCRIPTION = (
 # 1. LOAD
 # ─────────────────────────────────────────────
 
+
 def load_from_db(n_ky=0, qh_ky=20) -> pd.DataFrame:
     import psycopg2
+
     limit = f"LIMIT {n_ky}" if n_ky > 0 else ""
     sql = f"""
         SELECT * FROM public.l535kqdetail
@@ -65,9 +67,10 @@ def load_from_db(n_ky=0, qh_ky=20) -> pd.DataFrame:
         ORDER BY ky DESC {limit}
     """
     conn = psycopg2.connect(DATABASE_URL)
-    df   = pd.read_sql(sql, conn)
+    df = pd.read_sql(sql, conn)
     conn.close()
     return df.sort_values("ky").reset_index(drop=True)
+
 
 def load_from_csv(filepath) -> pd.DataFrame:
     df = pd.read_csv(filepath)
@@ -79,20 +82,27 @@ def load_from_csv(filepath) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 
 THU_MAP = {"T2": 2, "T3": 3, "T4": 4, "T5": 5, "T6": 6, "T7": 7, "CN": 8}
-DD_MAP  = {"CC": 0, "CL": 1, "LC": 2, "LL": 3}
+DD_MAP = {"CC": 0, "CL": 1, "LC": 2, "LL": 3}
+
 
 def _safe_int(s) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
+
 def _encode_thu(series) -> pd.Series:
     return series.astype(str).str.strip().map(THU_MAP)
 
+
 def _ngay_diff(d1: pd.Series, d2: pd.Series) -> pd.Series:
-    return (pd.to_datetime(d1, errors="coerce") -
-            pd.to_datetime(d2, errors="coerce")).dt.days
+    return (
+        pd.to_datetime(d1, errors="coerce") - pd.to_datetime(d2, errors="coerce")
+    ).dt.days
+
 
 def _encode_dd(n_first, n_last) -> pd.Series:
-    def _cl(n): return "C" if n % 2 == 0 else "L"
+    def _cl(n):
+        return "C" if n % 2 == 0 else "L"
+
     result = []
     for f, l in zip(n_first, n_last):
         if pd.isna(f) or pd.isna(l):
@@ -101,10 +111,12 @@ def _encode_dd(n_first, n_last) -> pd.Series:
             result.append(DD_MAP.get(_cl(int(f)) + _cl(int(l)), np.nan))
     return pd.Series(result, index=n_first.index)
 
+
 def get_drawn_set(row) -> set:
     """Lay tap hop n1-n5 tu mot row."""
     return {
-        int(row[c]) for c in ["n1","n2","n3","n4","n5"]
+        int(row[c])
+        for c in ["n1", "n2", "n3", "n4", "n5"]
         if pd.notna(row[c]) and row[c] != 0
     }
 
@@ -112,6 +124,7 @@ def get_drawn_set(row) -> set:
 # ─────────────────────────────────────────────
 # 3. FEATURE ENGINEERING
 # ─────────────────────────────────────────────
+
 
 def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     """
@@ -130,11 +143,14 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
         lambda v: sum(1 for c in v if c == "L") if len(v) == 5 else np.nan
     )
     d["cl5_pattern"] = s.apply(
-        lambda v: int("".join("0" if c=="C" else "1" for c in v), 2)
-        if len(v) == 5 else np.nan
+        lambda v: (
+            int("".join("0" if c == "C" else "1" for c in v), 2)
+            if len(v) == 5
+            else np.nan
+        )
     )
     d["thu_enc"] = _encode_thu(d["thu"])
-    d["dot"]     = pd.to_numeric(d["dot"], errors="coerce").fillna(0).astype(int)
+    d["dot"] = pd.to_numeric(d["dot"], errors="coerce").fillna(0).astype(int)
 
     if "jpck" in d.columns:
         d["jpck"] = pd.to_numeric(d["jpck"], errors="coerce").fillna(0)
@@ -145,7 +161,7 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
 
     # A. Biet truoc (lich) — no shift
     feat["thu_enc"] = d["thu_enc"]
-    feat["dot"]     = d["dot"]
+    feat["dot"] = d["dot"]
 
     # B. Global L535 ky truoc (shift 1)
     prev_cols = ["dd_enc", "sc", "sum", "cl5_l_count", "cl5_pattern", "dec0", "dec3"]
@@ -169,13 +185,13 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
             if col in d.columns:
                 base = d[col].shift(1)
                 feat[f"{col}_roll{w}_mean"] = base.rolling(w).mean()
-                feat[f"{col}_roll{w}_std"]  = base.rolling(w).std()
+                feat[f"{col}_roll{w}_std"] = base.rolling(w).std()
 
     # E. Mega features
     if all(c in d.columns for c in ["mgn1", "mgn6"]):
         mn = [_safe_int(d[f"mgn{i}"]) for i in range(1, 7)]
         if "mgthu" in d.columns:
-            feat["mg_thu_enc"]   = _encode_thu(d["mgthu"])
+            feat["mg_thu_enc"] = _encode_thu(d["mgthu"])
         if "mgngay" in d.columns:
             feat["mg_ngay_diff"] = _ngay_diff(d["ngay"], d["mgngay"])
         feat["mg_dd"] = _encode_dd(mn[0], mn[5])
@@ -184,7 +200,7 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     if all(c in d.columns for c in ["pwn1", "pwn6"]):
         pn = [_safe_int(d[f"pwn{i}"]) for i in range(1, 7)]
         if "pwthu" in d.columns:
-            feat["pw_thu_enc"]   = _encode_thu(d["pwthu"])
+            feat["pw_thu_enc"] = _encode_thu(d["pwthu"])
         if "pwngay" in d.columns:
             feat["pw_ngay_diff"] = _ngay_diff(d["ngay"], d["pwngay"])
         feat["pw_dd"] = _encode_dd(pn[0], pn[5])
@@ -212,100 +228,68 @@ def make_per_number_features(df: pd.DataFrame, num: int) -> pd.DataFrame:
     Tat ca deu shift >= 1.
 
     Features:
-      - n_hit_prev   : so `num` co xuat hien ky truoc khong (0/1)
-      - n_last_seen  : cach bao nhieu ky lan cuoi so `num` xuat hien
-      - n_streak     : so ky lien tiep KHONG xuat hien (reset ve 0 khi xuat hien)
-      - n_freq_10    : tan suat trong 10 ky gan nhat (ngan han)
-      - n_freq_20    : tan suat trong 20 ky gan nhat
-      - n_freq_50    : tan suat trong 50 ky gan nhat (dai han)
-      - n_is_qhl     : so `num` co trong danh sach QHL khong
-      - n_pair_freq  : tan suat so `num` xuat hien cung cac so ky truoc (30 ky)
-      - dot_prev     : dot (1/2) cua ky truoc
-      - n_is_even    : so chan (1) hay le (0)
-      - n_dec        : chuc cua so (0-3)
+      - n_hit_prev       : so `num` co xuat hien ky truoc khong (0/1)
+      - n_last_seen      : cach bao nhieu ky lan cuoi so `num` xuat hien
+      - n_freq_20        : tan suat trong 20 ky gan nhat (shift 1)
+      - n_freq_50        : tan suat trong 50 ky gan nhat (shift 1)
+      - n_is_qhl         : so `num` co trong danh sach QHL khong
+      - n_is_even        : so chan (1) hay le (0)
+      - n_dec            : chuc cua so (0-3)
     """
     feat = pd.DataFrame(index=df.index)
 
+    # Ket qua ky truoc: so `num` co xuat hien n1-n5 khong
     hit = df.apply(lambda r: int(num in get_drawn_set(r)), axis=1)
 
-    # n_hit_prev
+    # n_hit_prev: hit ky truoc
     feat["n_hit_prev"] = hit.shift(1)
 
-    # n_last_seen
+    # n_last_seen: cach bao nhieu ky lan cuoi xuat hien
     last_seen = []
     last = np.nan
     for i, h in enumerate(hit):
         if i == 0:
             last_seen.append(np.nan)
-            if h == 1: last = 0
+            if h == 1:
+                last = 0
         else:
-            last_seen.append(np.nan if pd.isna(last) else i - last)
-            if h == 1: last = i
+            if pd.isna(last):
+                last_seen.append(np.nan)
+            else:
+                last_seen.append(i - last)
+            if h == 1:
+                last = i
     feat["n_last_seen"] = pd.Series(last_seen, index=df.index).shift(1)
 
-    # n_streak: so ky lien tiep khong xuat hien
-    streak = []
-    cur_streak = 0
-    for i, h in enumerate(hit):
-        if i == 0:
-            streak.append(np.nan)
-        else:
-            streak.append(float(cur_streak))
-        if h == 1:
-            cur_streak = 0
-        else:
-            cur_streak += 1
-    feat["n_streak"] = pd.Series(streak, index=df.index).shift(1)
-
-    # n_freq_10, n_freq_20, n_freq_50
+    # n_freq_20, n_freq_50: rolling mean (shift 1 roi rolling)
     hit_shifted = hit.shift(1)
-    feat["n_freq_10"] = hit_shifted.rolling(10).mean()
     feat["n_freq_20"] = hit_shifted.rolling(20).mean()
     feat["n_freq_50"] = hit_shifted.rolling(50).mean()
 
-    # n_is_qhl
+    # n_is_qhl: so `num` co trong QHL cua ky truoc khong
     if "qhl" in df.columns:
+
         def _in_qhl(v):
-            if pd.isna(v) or v == "": return 0.0
+            if pd.isna(v) or v == "":
+                return 0.0
             try:
-                return float(num in [int(x) for x in str(v).split(",") if x.strip()])
-            except: return 0.0
+                nums = [int(x) for x in str(v).split(",") if x.strip()]
+                return float(num in nums)
+            except:
+                return 0.0
+
         feat["n_is_qhl"] = df["qhl"].shift(1).apply(_in_qhl)
 
-    # n_pair_freq: tan suat so `num` xuat hien cung cac so ky truoc (30 ky)
-    # Voi moi ky i, xem 30 ky truoc: co ky nao ma ca `num` lan so ky i-1 deu xuat hien
-    prev_nums = df.apply(get_drawn_set, axis=1).shift(1)   # so ky truoc
-    pair_vals = []
-    for i in range(len(df)):
-        if i < 31:
-            pair_vals.append(np.nan)
-            continue
-        pn = prev_nums.iloc[i]   # so ky truoc (dung lam "anchor")
-        if not pn or pd.isna(list(pn)[0] if pn else np.nan):
-            pair_vals.append(0.0)
-            continue
-        # Trong 30 ky truoc do (shift 1 nen window la i-1 den i-30)
-        count = 0
-        for j in range(i - 30, i):
-            drawn_j = get_drawn_set(df.iloc[j])
-            if num in drawn_j and len(drawn_j & pn) > 0:
-                count += 1
-        pair_vals.append(count / 30.0)
-    feat["n_pair_freq"] = pd.Series(pair_vals, index=df.index)
-
-    # dot_prev: dot (1/2) cua ky truoc
-    if "dot" in df.columns:
-        feat["dot_prev"] = pd.to_numeric(df["dot"], errors="coerce").shift(1)
-
-    # Static
+    # Static features (khong can shift)
     feat["n_is_even"] = float(num % 2 == 0)
-    feat["n_dec"]     = float(num // 10)
+    feat["n_dec"] = float(num // 10)
 
     return feat
 
 
-def build_dataset(df: pd.DataFrame, num: int, global_feat: pd.DataFrame,
-                  lags: int = 3) -> tuple:
+def build_dataset(
+    df: pd.DataFrame, num: int, global_feat: pd.DataFrame, lags: int = 3
+) -> tuple:
     """
     Gop global_feat + per_number_feat, tao target cho so `num`.
 
@@ -330,7 +314,7 @@ def build_dataset(df: pd.DataFrame, num: int, global_feat: pd.DataFrame,
 
     # Tach train (bo ky cuoi) va predict_row (ky cuoi)
     combined_train = combined.iloc[:-1].reset_index(drop=True)
-    predict_row    = combined.iloc[[-1]]   # ky moi nhat: dung features, bo target
+    predict_row = combined.iloc[[-1]]  # ky moi nhat: dung features, bo target
 
     return combined_train, predict_row, feature_cols
 
@@ -339,22 +323,23 @@ def build_dataset(df: pd.DataFrame, num: int, global_feat: pd.DataFrame,
 # 4. XGB BUILDER
 # ─────────────────────────────────────────────
 
+
 def make_xgb(params: dict = None):
     defaults = dict(
-        n_estimators          = 400,
-        max_depth             = 2,
-        learning_rate         = 0.05,
-        subsample             = 0.7,
-        colsample_bytree      = 0.6,
-        min_child_weight      = 5,
-        gamma                 = 1,
-        reg_alpha             = 0.1,
-        reg_lambda            = 2.0,
-        objective             = "binary:logistic",
-        eval_metric           = "logloss",
-        random_state          = 42,
-        n_jobs                = -1,
-        early_stopping_rounds = 50,
+        n_estimators=400,
+        max_depth=2,
+        learning_rate=0.05,
+        subsample=0.7,
+        colsample_bytree=0.6,
+        min_child_weight=5,
+        gamma=1,
+        reg_alpha=0.1,
+        reg_lambda=2.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=-1,
+        early_stopping_rounds=50,
     )
     if params:
         defaults.update(params)
@@ -365,9 +350,10 @@ def make_xgb(params: dict = None):
 # 5. WALK-FORWARD
 # ─────────────────────────────────────────────
 
+
 def _walk_forward_splits(n: int, min_train: int, val_size: int):
     splits = []
-    start  = min_train
+    start = min_train
     while start + val_size <= n:
         splits.append((np.arange(0, start), np.arange(start, start + val_size)))
         start += val_size
@@ -378,6 +364,7 @@ def _walk_forward_splits(n: int, min_train: int, val_size: int):
 # 6. TRAIN ONE NUMBER
 # ─────────────────────────────────────────────
 
+
 def _make_decay_weights(n: int, decay: float = 0.995) -> np.ndarray:
     """
     Tao weight giam dan theo thoi gian (exponential decay).
@@ -386,15 +373,19 @@ def _make_decay_weights(n: int, decay: float = 0.995) -> np.ndarray:
     decay=0.990: sau 100 ky weight = 0.990^100 ~ 0.37
     """
     idx = np.arange(n)
-    w   = decay ** (n - 1 - idx)   # row cuoi = decay^0 = 1.0
-    return w / w.mean()             # normalize de tong khong doi
+    w = decay ** (n - 1 - idx)  # row cuoi = decay^0 = 1.0
+    return w / w.mean()  # normalize de tong khong doi
 
 
-def train_one(combined: pd.DataFrame, feature_cols: list,
-              val_size: int, min_train: int,
-              train_window: int = 0,
-              decay: float = 0.995,
-              xgb_params: dict = None) -> tuple:
+def train_one(
+    combined: pd.DataFrame,
+    feature_cols: list,
+    val_size: int,
+    min_train: int,
+    train_window: int = 0,
+    decay: float = 0.995,
+    xgb_params: dict = None,
+) -> tuple:
     """
     Train walk-forward cho 1 so.
 
@@ -409,7 +400,7 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
     X = combined[feature_cols].values
     y = combined["y"].values
 
-    splits    = _walk_forward_splits(len(X), min_train, val_size)
+    splits = _walk_forward_splits(len(X), min_train, val_size)
     prec_list, rec_list = [], []
 
     for tr_idx, va_idx in splits:
@@ -422,17 +413,18 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
         # Sliding window trong CV: lay toi da train_window ky cuoi cua fold
         if train_window > 0 and len(tr_idx) > train_window:
             tr_idx = tr_idx[-train_window:]
-            X_tr   = X[tr_idx]
-            y_tr   = y[tr_idx]
+            X_tr = X[tr_idx]
+            y_tr = y[tr_idx]
 
         # Time decay weight
-        sw_bal   = compute_sample_weight("balanced", y_tr)
+        sw_bal = compute_sample_weight("balanced", y_tr)
         sw_decay = _make_decay_weights(len(y_tr), decay)
-        sw_tr    = sw_bal * sw_decay
+        sw_tr = sw_bal * sw_decay
 
         mdl = make_xgb(xgb_params)
         mdl.fit(
-            X_tr, y_tr,
+            X_tr,
+            y_tr,
             sample_weight=sw_tr,
             eval_set=[(X_va, y_va)],
             verbose=False,
@@ -451,9 +443,9 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
         X_fin = X
         y_fin = y
 
-    sw_bal_f   = compute_sample_weight("balanced", y_fin)
+    sw_bal_f = compute_sample_weight("balanced", y_fin)
     sw_decay_f = _make_decay_weights(len(y_fin), decay)
-    sw_fin     = sw_bal_f * sw_decay_f
+    sw_fin = sw_bal_f * sw_decay_f
 
     final_p = dict(xgb_params or {})
     final_p["early_stopping_rounds"] = None
@@ -461,7 +453,7 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
     final.fit(X_fin, y_fin, sample_weight=sw_fin, verbose=False)
 
     mean_prec = float(np.mean(prec_list)) if prec_list else 0.0
-    mean_rec  = float(np.mean(rec_list))  if rec_list  else 0.0
+    mean_rec = float(np.mean(rec_list)) if rec_list else 0.0
     return final, mean_prec, mean_rec
 
 
@@ -469,18 +461,25 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
 # 7. TRAIN ALL 35
 # ─────────────────────────────────────────────
 
-def train_all(df: pd.DataFrame, global_feat: pd.DataFrame,
-              lags: int, val_size: int, min_train: int,
-              train_window: int = 0, decay: float = 0.995,
-              xgb_params: dict = None,
-              show_importance: bool = False) -> dict:
+
+def train_all(
+    df: pd.DataFrame,
+    global_feat: pd.DataFrame,
+    lags: int,
+    val_size: int,
+    min_train: int,
+    train_window: int = 0,
+    decay: float = 0.995,
+    xgb_params: dict = None,
+    show_importance: bool = False,
+) -> dict:
     """
     Train 35 model, tra ve dict: num -> {model, prec, rec, feature_cols, predict_row}.
     train_window: chi dung N ky gan nhat (0 = tat ca)
     decay       : he so giam weight theo thoi gian
     """
     results = {}
-    baseline_prec = 5 * 8 / 35 / 8   # = 14.3%
+    baseline_prec = 5 * 8 / 35 / 8  # = 14.3%
 
     print(f"\n  Baseline precision (random 8/35): {baseline_prec:.1%}")
     if train_window > 0:
@@ -494,25 +493,27 @@ def train_all(df: pd.DataFrame, global_feat: pd.DataFrame,
             df, num, global_feat, lags
         )
         model, prec, rec = train_one(
-            combined_train, feature_cols,
-            val_size, min_train,
+            combined_train,
+            feature_cols,
+            val_size,
+            min_train,
             train_window=train_window,
             decay=decay,
             xgb_params=xgb_params,
         )
         results[num] = dict(
-            model        = model,
-            prec         = prec,
-            rec          = rec,
-            feature_cols = feature_cols,
-            combined     = combined_train,
-            predict_row  = predict_row,
+            model=model,
+            prec=prec,
+            rec=rec,
+            feature_cols=feature_cols,
+            combined=combined_train,
+            predict_row=predict_row,
         )
         flag = "✅" if prec > baseline_prec else "⚠️ "
         print(f"  {num:>4}  {prec:>8.3f}  {rec:>8.3f}  {flag}")
 
     precs = [results[n]["prec"] for n in ALL_NUMS]
-    recs  = [results[n]["rec"]  for n in ALL_NUMS]
+    recs = [results[n]["rec"] for n in ALL_NUMS]
     print(f"\n  Mean CV Precision : {np.mean(precs):.3f}")
     print(f"  Mean CV Recall    : {np.mean(recs):.3f}")
     print(f"  So beat baseline  : {sum(1 for p in precs if p > baseline_prec)}/35")
@@ -527,11 +528,12 @@ def train_all(df: pd.DataFrame, global_feat: pd.DataFrame,
 # 8. IMPORTANCE (tong hop)
 # ─────────────────────────────────────────────
 
+
 def _show_top_importance(results: dict, top_n: int = 15):
     """Tong hop importance trung binh tren 35 model."""
     imp_sum = {}
     for num, r in results.items():
-        mdl  = r["model"]
+        mdl = r["model"]
         cols = r["feature_cols"]
         for c, v in zip(cols, mdl.feature_importances_):
             imp_sum[c] = imp_sum.get(c, 0.0) + v
@@ -547,86 +549,13 @@ def _show_top_importance(results: dict, top_n: int = 15):
 
 
 # ─────────────────────────────────────────────
-# 10. ENSEMBLE + FILTER
+# 9. PREDICT TOP-K
 # ─────────────────────────────────────────────
 
-ENSEMBLE_CONFIGS = [
-    {"lags": 3, "decay": 0.995, "train_window": 0,   "label": "M1(lag3,d0.995,all)"},
-    {"lags": 5, "decay": 0.990, "train_window": 0,   "label": "M2(lag5,d0.990,all)"},
-    {"lags": 3, "decay": 0.995, "train_window": 300, "label": "M3(lag3,d0.995,w300)"},
-]
 
-def train_ensemble(df: pd.DataFrame, val_size: int, min_train: int,
-                   xgb_params: dict = None) -> list:
-    """
-    Train 3 bo model voi config khac nhau.
-    Tra ve list cac results dict.
-    """
-    all_results = []
-    for cfg in ENSEMBLE_CONFIGS:
-        lags         = cfg["lags"]
-        decay        = cfg["decay"]
-        train_window = cfg["train_window"]
-        label        = cfg["label"]
-        print(f"\n  ── Ensemble {label} ──")
-
-        global_feat = make_global_features(df, lags=lags)
-        results = train_all(
-            df, global_feat,
-            lags=lags,
-            val_size=val_size,
-            min_train=min_train,
-            train_window=train_window,
-            decay=decay,
-            xgb_params=xgb_params,
-            show_importance=False,
-        )
-        all_results.append(results)
-    return all_results
-
-
-def predict_top_k_ensemble(all_results: list, top_k: int = 8,
-                            filter_threshold: float = 0.12) -> list:
-    """
-    Average xac suat tu nhieu bo model.
-    Filter: loai so co CV_prec trung binh < filter_threshold.
-    Tra ve list (num, avg_prob, avg_cvprec) sap xep giam dan.
-    """
-    proba_list = []
-    for num in ALL_NUMS:
-        probs  = []
-        cvprecs = []
-        for results in all_results:
-            r           = results[num]
-            feat_cols   = r["feature_cols"]
-            model       = r["model"]
-            predict_row = r["predict_row"]
-            last_X      = predict_row[feat_cols].values
-            prob        = model.predict_proba(last_X)[0][1]
-            probs.append(prob)
-            cvprecs.append(r["prec"])
-
-        avg_prob   = float(np.mean(probs))
-        avg_cvprec = float(np.mean(cvprecs))
-        proba_list.append((num, avg_prob, avg_cvprec))
-
-    # Filter: loai so co avg_cvprec < threshold
-    n_before = len(proba_list)
-    if filter_threshold > 0:
-        proba_list = [
-            (n, p, c) for n, p, c in proba_list
-            if c >= filter_threshold
-        ]
-    n_after = len(proba_list)
-    if n_before != n_after:
-        print(f"\n  🔍 Filter threshold={filter_threshold:.1%}: "
-              f"loai {n_before - n_after} so, con lai {n_after} so")
-
-    proba_list.sort(key=lambda x: -x[1])
-    return proba_list
-
-def predict_top_k(df: pd.DataFrame, global_feat: pd.DataFrame,
-                  results: dict, top_k: int = 8) -> list:
+def predict_top_k(
+    df: pd.DataFrame, global_feat: pd.DataFrame, results: dict, top_k: int = 8
+) -> list:
     """
     Voi moi so 1-35, lay xac suat tu model dung predict_row (ky moi nhat).
     predict_row chua duoc dung de train → no-leak thuc su.
@@ -634,53 +563,63 @@ def predict_top_k(df: pd.DataFrame, global_feat: pd.DataFrame,
     """
     proba_list = []
     for num in ALL_NUMS:
-        r           = results[num]
-        feat_cols   = r["feature_cols"]
-        model       = r["model"]
+        r = results[num]
+        feat_cols = r["feature_cols"]
+        model = r["model"]
         predict_row = r["predict_row"]
 
         last_X = predict_row[feat_cols].values
-        prob   = model.predict_proba(last_X)[0][1]
+        prob = model.predict_proba(last_X)[0][1]
         proba_list.append((num, prob))
 
     proba_list.sort(key=lambda x: -x[1])
     return proba_list
 
 
-def show_prediction(df: pd.DataFrame, proba_list: list,
-                    top_k: int = 8, results: dict = None):
-    """
-    proba_list co the la:
-      - [(num, prob)]         — single model
-      - [(num, prob, cvprec)] — ensemble
-    """
-    last_ky  = (df["ky"].iloc[-1] or "").strip()
-    next_ky  = f"(sau {last_ky})"
-    top      = proba_list[:top_k]
+def show_prediction(
+    df: pd.DataFrame, proba_list: list, top_k: int = 8, results: dict = None
+):
+    # Ky cuoi trong DB = ky vua xo xong, dung features cua no de predict ky tiep
+    last_ky = (df["ky"].iloc[-1] or "").strip()
+    next_ky = f"(sau {last_ky})"
+    top = proba_list[:top_k]
+    rest = proba_list[top_k:]
 
     print(f"\n{'═'*56}")
     print(f"📌 Input : ky {last_ky} (features cua ky nay)")
     print(f"🎯 Du doan {top_k} so cho ky {next_ky}:")
     print(f"{'═'*56}")
 
-    nums_chosen = []
-    for rank, item in enumerate(top, 1):
-        num  = item[0]
-        prob = item[1]
-        cvp  = item[2] if len(item) > 2 else (
-            results[num]["prec"] if results else 0.0
-        )
-        bar  = "█" * int(prob * 30)
-        print(f"  #{rank:>2}  So {num:>2}  P={prob:.3f}  CV_prec={cvp:.3f}  {bar}")
-        nums_chosen.append(num)
+    # In top k
+    nums_chosen = [n for n, _ in top]
+    for rank, (num, prob) in enumerate(top, 1):
+        cv_prec = results[num]["prec"] if results else 0.0
+        bar = "█" * int(prob * 30)
+        print(f"  #{rank:>2}  So {num:>2}  P={prob:.3f}  CV_prec={cv_prec:.3f}  {bar}")
 
     print(f"\n  → Chon: {sorted(nums_chosen)}")
-    n_even  = sum(1 for n in nums_chosen if n % 2 == 0)
+
+    # Thong ke tap hop
+    chosen_set = set(nums_chosen)
+    n_even = sum(1 for n in nums_chosen if n % 2 == 0)
+    n_odd = top_k - n_even
     dec_cnt = Counter(n // 10 for n in nums_chosen)
-    print(f"  → Chan/Le: {n_even}C / {top_k - n_even}L")
-    print(f"  → Chuc   : " + "  ".join(
-        f"{d*10}x:{dec_cnt.get(d,0)}" for d in range(4)
-    ))
+    print(f"  → Chan/Le: {n_even}C / {n_odd}L")
+    print(f"  → Chuc   : " + "  ".join(f"{d*10}x:{dec_cnt.get(d,0)}" for d in range(4)))
+
+    # So sanh voi QHL neu co
+    if results:
+        qhl_hits = []
+        for num in nums_chosen:
+            if (
+                results[num]["combined"]["n_is_qhl"].iloc[-1] == 1.0
+                if "n_is_qhl" in results[num]["combined"].columns
+                else False
+            ):
+                qhl_hits.append(num)
+        if qhl_hits:
+            print(f"  → So trong QHL: {sorted(qhl_hits)}")
+
     print(f"{'═'*56}\n")
     return nums_chosen
 
@@ -689,8 +628,8 @@ def show_prediction(df: pd.DataFrame, proba_list: list,
 # 10. EVALUATE HISTORY (back-test)
 # ─────────────────────────────────────────────
 
-def evaluate_history(df: pd.DataFrame, results: dict,
-                     top_k: int = 8, last_n: int = 50):
+
+def evaluate_history(df: pd.DataFrame, results: dict, top_k: int = 8, last_n: int = 50):
     """
     Back-test tren last_n ky cuoi: moi ky chon top_k so,
     so voi ket qua thuc te, tinh precision va hit count.
@@ -700,23 +639,23 @@ def evaluate_history(df: pd.DataFrame, results: dict,
     print(f"  {'─'*65}")
 
     prec_list = []
-    hit_list  = []
+    hit_list = []
 
     # Lay tung ky trong khoang back-test
     n_total = len(df)
-    start   = max(0, n_total - last_n - 1)
+    start = max(0, n_total - last_n - 1)
 
     for i in range(start, n_total - 1):
-        ky_str  = (df["ky"].iloc[i] or "").strip()
-        actual  = get_drawn_set(df.iloc[i + 1])   # ket qua ky tiep theo
+        ky_str = (df["ky"].iloc[i] or "").strip()
+        actual = get_drawn_set(df.iloc[i + 1])  # ket qua ky tiep theo
 
         # Lay xac suat tung so tai thoi diem i (row i trong combined)
         proba_i = []
         for num in ALL_NUMS:
-            r        = results[num]
+            r = results[num]
             combined = r["combined"]
-            feat_c   = r["feature_cols"]
-            model    = r["model"]
+            feat_c = r["feature_cols"]
+            model = r["model"]
 
             # Tim row trong combined tuong ung ky nay
             mask = combined["ky"].astype(str).str.strip() == ky_str
@@ -724,33 +663,32 @@ def evaluate_history(df: pd.DataFrame, results: dict,
                 proba_i.append((num, 0.0))
                 continue
             row_idx = combined[mask].index[0]
-            X_row   = combined.loc[[row_idx], feat_c].values
-            prob    = model.predict_proba(X_row)[0][1]
+            X_row = combined.loc[[row_idx], feat_c].values
+            prob = model.predict_proba(X_row)[0][1]
             proba_i.append((num, prob))
 
         proba_i.sort(key=lambda x: -x[1])
         chosen = set(n for n, _ in proba_i[:top_k])
-        hits   = chosen & actual
-        prec   = len(hits) / top_k
+        hits = chosen & actual
+        prec = len(hits) / top_k
         prec_list.append(prec)
         hit_list.append(len(hits))
 
         # In moi 5 ky
         if (i - start) % 5 == 0 or i == n_total - 2:
             chosen_str = " ".join(f"{n:>2}" for n in sorted(chosen))
-            print(
-                f"  {ky_str:<8}  [{chosen_str}]"
-                f"  {len(hits):>5}  {prec:>6.1%}"
-            )
+            print(f"  {ky_str:<8}  [{chosen_str}]" f"  {len(hits):>5}  {prec:>6.1%}")
 
     mean_prec = np.mean(prec_list)
     mean_hits = np.mean(hit_list)
-    baseline  = 5 / 35 * top_k / top_k   # = 14.3%
-    lift      = mean_prec - baseline
-    flag      = "✅" if lift > 0.02 else ("🟡" if lift > 0 else "⚠️ ")
+    baseline = 5 / 35 * top_k / top_k  # = 14.3%
+    lift = mean_prec - baseline
+    flag = "✅" if lift > 0.02 else ("🟡" if lift > 0 else "⚠️ ")
 
-    print(f"\n  Mean precision : {mean_prec:.3f}  (baseline={baseline:.3f})  "
-          f"lift={lift:+.3f}  {flag}")
+    print(
+        f"\n  Mean precision : {mean_prec:.3f}  (baseline={baseline:.3f})  "
+        f"lift={lift:+.3f}  {flag}"
+    )
     print(f"  Mean hits/ky   : {mean_hits:.2f} / {top_k}")
 
 
@@ -758,33 +696,40 @@ def evaluate_history(df: pd.DataFrame, results: dict,
 # 11. OPTUNA TUNING
 # ─────────────────────────────────────────────
 
-def optuna_tune(df: pd.DataFrame, global_feat: pd.DataFrame,
-                lags: int, val_size: int, min_train: int,
-                n_trials: int = 30) -> dict:
+
+def optuna_tune(
+    df: pd.DataFrame,
+    global_feat: pd.DataFrame,
+    lags: int,
+    val_size: int,
+    min_train: int,
+    n_trials: int = 30,
+) -> dict:
     """
     Tune hyperparameter tren 5 so ngau nhien (nhanh hon tune ca 35).
     """
     try:
         import optuna
+
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except ImportError:
         print("  ⚠️  Optuna chua cai: pip install optuna")
         return None
 
-    sample_nums = [7, 14, 21, 28, 35]   # 5 so dai dien
+    sample_nums = [7, 14, 21, 28, 35]  # 5 so dai dien
 
     def objective(trial):
         params = dict(
-            max_depth        = trial.suggest_int("max_depth", 2, 4),
-            learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-            n_estimators     = trial.suggest_int("n_estimators", 200, 600),
-            subsample        = trial.suggest_float("subsample", 0.5, 0.9),
-            colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9),
-            min_child_weight = trial.suggest_int("min_child_weight", 3, 20),
-            gamma            = trial.suggest_float("gamma", 0.0, 3.0),
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.0, 1.0),
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 4.0),
-            early_stopping_rounds = 40,
+            max_depth=trial.suggest_int("max_depth", 2, 4),
+            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            n_estimators=trial.suggest_int("n_estimators", 200, 600),
+            subsample=trial.suggest_float("subsample", 0.5, 0.9),
+            colsample_bytree=trial.suggest_float("colsample_bytree", 0.4, 0.9),
+            min_child_weight=trial.suggest_int("min_child_weight", 3, 20),
+            gamma=trial.suggest_float("gamma", 0.0, 3.0),
+            reg_alpha=trial.suggest_float("reg_alpha", 0.0, 1.0),
+            reg_lambda=trial.suggest_float("reg_lambda", 0.5, 4.0),
+            early_stopping_rounds=40,
         )
         prec_all = []
         for num in sample_nums:
@@ -809,8 +754,10 @@ def optuna_tune(df: pd.DataFrame, global_feat: pd.DataFrame,
 # 12. SAVE PREDICT TO DB
 # ─────────────────────────────────────────────
 
-def save_predict(args, df: pd.DataFrame, proba_list: list,
-                 results: dict, cv_prec_mean: float):
+
+def save_predict(
+    args, df: pd.DataFrame, proba_list: list, results: dict, cv_prec_mean: float
+):
     """
     Luu ket qua du doan vao table l535kqpredict.
     proba_list: list (num, prob) sap xep giam dan (tat ca 35 so).
@@ -818,7 +765,7 @@ def save_predict(args, df: pd.DataFrame, proba_list: list,
     """
     import psycopg2
 
-    input_ky  = (df["ky"].iloc[-1] or "").strip()
+    input_ky = (df["ky"].iloc[-1] or "").strip()
 
     # Uoc tinh predict_ky: ky tiep theo sau input_ky (khong biet chinh xac)
     # De null, user tu dien sau khi biet ky nao duoc xo tiep
@@ -830,19 +777,16 @@ def save_predict(args, df: pd.DataFrame, proba_list: list,
 
     # Chuan bi 18 so (pad bang None neu top_k < 18)
     top18 = proba_list[:18]
-    row   = {}
+    row = {}
     for i in range(1, 19):
         if i <= len(top18):
-            item = top18[i - 1]
-            num  = item[0]
-            prob = item[1]
-            cvp  = item[2] if len(item) > 2 else (results[num]["prec"] if results else 0.0)
-            row[f"n{i}"]   = int(num)
-            row[f"p{i}"]   = float(prob)
-            row[f"cvp{i}"] = float(cvp)
+            num, prob = top18[i - 1]
+            row[f"n{i}"] = int(num)
+            row[f"p{i}"] = float(prob)
+            row[f"cvp{i}"] = float(results[num]["prec"])
         else:
-            row[f"n{i}"]   = None
-            row[f"p{i}"]   = None
+            row[f"n{i}"] = None
+            row[f"p{i}"] = None
             row[f"cvp{i}"] = None
 
     sql = """
@@ -902,30 +846,32 @@ def save_predict(args, df: pd.DataFrame, proba_list: list,
     """
 
     params = {
-        "run_at"      : datetime.now(timezone.utc),
-        "version"     : VERSION,
-        "description" : DESCRIPTION,
-        "source"      : getattr(args, "source", "db"),
-        "lags"        : getattr(args, "lags", 3),
+        "run_at": datetime.now(timezone.utc),
+        "version": VERSION,
+        "description": DESCRIPTION,
+        "source": getattr(args, "source", "db"),
+        "lags": getattr(args, "lags", 3),
         "train_window": getattr(args, "train_window", 0),
-        "decay"       : getattr(args, "decay", 0.995),
-        "top_k"       : getattr(args, "top", 8),
-        "score_mode"  : "ensemble" if getattr(args, "ensemble", False) else "pure_p",
+        "decay": getattr(args, "decay", 0.995),
+        "top_k": getattr(args, "top", 8),
+        "score_mode": "pure_p",
         "cv_prec_mean": float(cv_prec_mean),
-        "input_ky"    : input_ky,
-        "predict_ky"  : predict_ky,
+        "input_ky": input_ky,
+        "predict_ky": predict_ky,
         **row,
     }
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
-    cur  = conn.cursor()
+    cur = conn.cursor()
     try:
         cur.execute(sql, params)
         conn.commit()
-        print(f"\n💾 Da luu du doan vao l535kqpredict"
-              f"  (input_ky={input_ky}, predict_ky={predict_ky},"
-              f"  version={VERSION})")
+        print(
+            f"\n💾 Da luu du doan vao l535kqpredict"
+            f"  (input_ky={input_ky}, predict_ky={predict_ky},"
+            f"  version={VERSION})"
+        )
     except Exception as e:
         conn.rollback()
         print(f"\n⚠️  Luu that bai: {e}")
@@ -938,6 +884,7 @@ def save_predict(args, df: pd.DataFrame, proba_list: list,
 # 13. UPDATE RESULT FROM l535kqdetail
 # ─────────────────────────────────────────────
 
+
 def update_result():
     """
     Tim cac row trong l535kqpredict co actual_n1 IS NULL,
@@ -949,7 +896,7 @@ def update_result():
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
-    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     try:
         # 1. Lay cac row chua co ket qua
@@ -969,12 +916,15 @@ def update_result():
             predict_ky = (row["predict_ky"] or "").strip()
 
             # 2. Lay ket qua thuc te tu l535kqdetail
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT n1,n2,n3,n4,n5,n6
                 FROM public.l535kqdetail
                 WHERE ky = %s
                 LIMIT 1
-            """, (predict_ky,))
+            """,
+                (predict_ky,),
+            )
             actual = cur.fetchone()
 
             if actual is None:
@@ -990,7 +940,7 @@ def update_result():
             actual_n6 = actual["n6"]
 
             # 4. Lay tap so du doan (top_k so dau)
-            top_k    = int(row["top_k"] or 8)
+            top_k = int(row["top_k"] or 8)
             pred_nums = []
             for i in range(1, 19):
                 n = row[f"n{i}"]
@@ -998,12 +948,13 @@ def update_result():
                     pred_nums.append(int(n))
 
             # 5. Tinh hit
-            hits      = set(pred_nums) & actual_nums
-            hit_cnt   = len(hits)
-            prec_val  = hit_cnt / top_k if top_k > 0 else 0.0
+            hits = set(pred_nums) & actual_nums
+            hit_cnt = len(hits)
+            prec_val = hit_cnt / top_k if top_k > 0 else 0.0
 
             # 6. Update
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE public.l535kqpredict SET
                     actual_n1     = %s,
                     actual_n2     = %s,
@@ -1015,13 +966,20 @@ def update_result():
                     precision_val = %s,
                     updated_at    = %s
                 WHERE id = %s
-            """, (
-                actual["n1"], actual["n2"], actual["n3"],
-                actual["n4"], actual["n5"], actual_n6,
-                hit_cnt, prec_val,
-                datetime.now(timezone.utc),
-                row["id"],
-            ))
+            """,
+                (
+                    actual["n1"],
+                    actual["n2"],
+                    actual["n3"],
+                    actual["n4"],
+                    actual["n5"],
+                    actual_n6,
+                    hit_cnt,
+                    prec_val,
+                    datetime.now(timezone.utc),
+                    row["id"],
+                ),
+            )
 
             flag = "✅" if prec_val > 0.143 else ("🟡" if prec_val > 0 else "⚠️ ")
             print(
@@ -1049,36 +1007,58 @@ def update_result():
 # 14. MAIN
 # ─────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(description="XGBoost predict 35 so L535")
-    parser.add_argument("--update_result", action="store_true",
-                        help="Cap nhat ket qua thuc te tu l535kqdetail")
-    parser.add_argument("--source",      choices=["db", "csv"], default="db")
-    parser.add_argument("--file",        default="l535kqdetail_dat.csv")
-    parser.add_argument("--n_ky",        type=int, default=0)
-    parser.add_argument("--qh_ky",       type=int, default=20)
-    parser.add_argument("--lags",        type=int, default=3)
-    parser.add_argument("--top",         type=int, default=8,
-                        help="So luong so chon (mac dinh: 8)")
-    parser.add_argument("--val_size",    type=int, default=20,
-                        help="So ky moi fold walk-forward (mac dinh: 20)")
-    parser.add_argument("--min_train",   type=int, default=200,
-                        help="So ky toi thieu de bat dau train (mac dinh: 200)")
-    parser.add_argument("--importance",  action="store_true",
-                        help="In feature importance trung binh 35 model")
-    parser.add_argument("--backtest",    type=int, default=0,
-                        help="Back-test N ky cuoi (0 = tat)")
-    parser.add_argument("--train_window", type=int,   default=0,
-                        help="Sliding window: chi dung N ky gan nhat (0 = tat ca)")
-    parser.add_argument("--decay",        type=float, default=0.995,
-                        help="Time decay weight (0.99-1.0, 1.0 = tat decay)")
-    parser.add_argument("--save",         action="store_true",
-                        help="Luu ket qua du doan vao l535kqpredict")
-    parser.add_argument("--ensemble",    action="store_true",
-                        help="Dung ensemble 3 model (M1/M2/M3) thay vi 1 model")
-    parser.add_argument("--filter",      type=float, default=0.12,
-                        help="Filter threshold CV_prec (mac dinh 0.12, 0=tat filter)")
-    parser.add_argument("--tune",        action="store_true")
+    parser.add_argument(
+        "--update_result",
+        action="store_true",
+        help="Cap nhat ket qua thuc te tu l535kqdetail",
+    )
+    parser.add_argument("--source", choices=["db", "csv"], default="db")
+    parser.add_argument("--file", default="l535kqdetail_dat.csv")
+    parser.add_argument("--n_ky", type=int, default=0)
+    parser.add_argument("--qh_ky", type=int, default=20)
+    parser.add_argument("--lags", type=int, default=3)
+    parser.add_argument(
+        "--top", type=int, default=8, help="So luong so chon (mac dinh: 8)"
+    )
+    parser.add_argument(
+        "--val_size",
+        type=int,
+        default=20,
+        help="So ky moi fold walk-forward (mac dinh: 20)",
+    )
+    parser.add_argument(
+        "--min_train",
+        type=int,
+        default=200,
+        help="So ky toi thieu de bat dau train (mac dinh: 200)",
+    )
+    parser.add_argument(
+        "--importance",
+        action="store_true",
+        help="In feature importance trung binh 35 model",
+    )
+    parser.add_argument(
+        "--backtest", type=int, default=0, help="Back-test N ky cuoi (0 = tat)"
+    )
+    parser.add_argument(
+        "--train_window",
+        type=int,
+        default=0,
+        help="Sliding window: chi dung N ky gan nhat (0 = tat ca)",
+    )
+    parser.add_argument(
+        "--decay",
+        type=float,
+        default=0.995,
+        help="Time decay weight (0.99-1.0, 1.0 = tat decay)",
+    )
+    parser.add_argument(
+        "--save", action="store_true", help="Luu ket qua du doan vao l535kqpredict"
+    )
+    parser.add_argument("--tune", action="store_true")
     parser.add_argument("--tune_trials", type=int, default=30)
     args = parser.parse_args()
 
@@ -1099,95 +1079,58 @@ def main():
     )
     print(f"   {len(df)} ky")
 
-    has_mega  = "mgn1" in df.columns
+    has_mega = "mgn1" in df.columns
     has_power = "pwn1" in df.columns
-    has_jp    = "jpck" in df.columns
-    has_qhl   = "qhl"  in df.columns
+    has_jp = "jpck" in df.columns
+    has_qhl = "qhl" in df.columns
     print(f"   Mega  : {'✅' if has_mega  else '⚠️'}")
     print(f"   Power : {'✅' if has_power else '⚠️'}")
     print(f"   JP    : {'✅' if has_jp    else '⚠️'}")
     print(f"   QHL   : {'✅' if has_qhl   else '⚠️'}")
 
     print("\n⚙️  Global feature engineering...")
-    if not args.ensemble:
-        global_feat = make_global_features(df, lags=args.lags)
-        print(f"   {global_feat.shape[1]} global features")
+    global_feat = make_global_features(df, lags=args.lags)
+    print(f"   {global_feat.shape[1]} global features")
 
     # Optuna tuning
     xgb_params = None
     if args.tune:
-        global_feat = make_global_features(df, lags=args.lags)
         xgb_params = optuna_tune(
-            df, global_feat,
+            df,
+            global_feat,
             lags=args.lags,
             val_size=args.val_size,
             min_train=args.min_train,
             n_trials=args.tune_trials,
         )
 
-    if args.ensemble:
-        # ── Ensemble mode ──
-        print(f"\n🚀 Training ensemble ({len(ENSEMBLE_CONFIGS)} models)...")
-        all_results = train_ensemble(
-            df,
-            val_size=args.val_size,
-            min_train=args.min_train,
-            xgb_params=xgb_params,
-        )
+    print(f"\n🚀 Training 35 model (top={args.top})...")
+    results = train_all(
+        df,
+        global_feat,
+        lags=args.lags,
+        val_size=args.val_size,
+        min_train=args.min_train,
+        train_window=args.train_window,
+        decay=args.decay,
+        xgb_params=xgb_params,
+        show_importance=args.importance,
+    )
 
-        if args.backtest > 0:
-            # Back-test dung model dau tien (don gian)
-            evaluate_history(df, all_results[0], top_k=args.top, last_n=args.backtest)
+    # Back-test
+    if args.backtest > 0:
+        evaluate_history(df, results, top_k=args.top, last_n=args.backtest)
 
-        print(f"\n🔮 Predicting top {args.top} (ensemble + filter={args.filter:.0%})...")
-        proba_list   = predict_top_k_ensemble(
-            all_results, top_k=args.top, filter_threshold=args.filter
-        )
-        show_prediction(df, proba_list, top_k=args.top)
+    # Predict
+    print(f"\n🔮 Predicting top {args.top}...")
+    proba_list = predict_top_k(df, global_feat, results, top_k=args.top)
+    show_prediction(df, proba_list, top_k=args.top, results=results)
 
-        # CV prec mean tu model dau tien
-        cv_prec_mean = np.mean([all_results[0][n]["prec"] for n in ALL_NUMS])
-        results      = all_results[0]   # dung cho save
-
-    else:
-        # ── Single model mode ──
-        global_feat = make_global_features(df, lags=args.lags)
-        print(f"   {global_feat.shape[1]} global features")
-
-        print(f"\n🚀 Training 35 model (top={args.top})...")
-        results = train_all(
-            df, global_feat,
-            lags=args.lags,
-            val_size=args.val_size,
-            min_train=args.min_train,
-            train_window=args.train_window,
-            decay=args.decay,
-            xgb_params=xgb_params,
-            show_importance=args.importance,
-        )
-
-        if args.backtest > 0:
-            evaluate_history(df, results, top_k=args.top, last_n=args.backtest)
-
-        print(f"\n🔮 Predicting top {args.top}...")
-        proba_list = predict_top_k(df, global_feat, results, top_k=args.top)
-
-        # Apply filter neu co
-        if args.filter > 0:
-            before = len(proba_list)
-            proba_list = [
-                (n, p) for n, p in proba_list
-                if results[n]["prec"] >= args.filter
-            ]
-            if len(proba_list) < before:
-                print(f"  🔍 Filter {args.filter:.0%}: loai {before - len(proba_list)} so")
-
-        show_prediction(df, proba_list, top_k=args.top, results=results)
-        cv_prec_mean = np.mean([results[n]["prec"] for n in ALL_NUMS])
+    # CV prec mean
+    cv_prec_mean = np.mean([results[n]["prec"] for n in ALL_NUMS])
 
     # Save to DB
     if args.save:
-        # Rebuild proba_list dang (num, prob) neu can
         save_predict(args, df, proba_list, results, cv_prec_mean)
 
 
