@@ -273,25 +273,35 @@ def make_per_number_features(df: pd.DataFrame, num: int) -> pd.DataFrame:
         feat["n_is_qhl"] = df["qhl"].shift(1).apply(_in_qhl)
 
     # n_pair_freq: tan suat so `num` xuat hien cung cac so ky truoc (30 ky)
-    # Voi moi ky i, xem 30 ky truoc: co ky nao ma ca `num` lan so ky i-1 deu xuat hien
-    prev_nums = df.apply(get_drawn_set, axis=1).shift(1)   # so ky truoc
-    pair_vals = []
-    for i in range(len(df)):
-        if i < 31:
-            pair_vals.append(np.nan)
-            continue
-        pn = prev_nums.iloc[i]   # so ky truoc (dung lam "anchor")
-        if not pn or pd.isna(list(pn)[0] if pn else np.nan):
-            pair_vals.append(0.0)
-            continue
-        # Trong 30 ky truoc do (shift 1 nen window la i-1 den i-30)
-        count = 0
-        for j in range(i - 30, i):
-            drawn_j = get_drawn_set(df.iloc[j])
-            if num in drawn_j and len(drawn_j & pn) > 0:
-                count += 1
-        pair_vals.append(count / 30.0)
-    feat["n_pair_freq"] = pd.Series(pair_vals, index=df.index)
+    # Vectorized: precompute hit_matrix 1 lan ben ngoai neu co, o day dung
+    # rolling sum tren hit cua `num` va prev_has_overlap de tranh double loop.
+    #
+    # Dinh nghia: trong 30 ky gan nhat (shift 1), so ky nao co ca `num` XA
+    # va co it nhat 1 so chung voi tap so ky truoc (anchor)?
+    #
+    # Logic tuong duong voi code cu nhung dung pandas thuan:
+    #   hit_num[j]       = (num in drawn_j)          — da co san o tren
+    #   prev_set[i]      = drawn_set(ky i-1)          — shift(1) cua drawn_sets
+    #   overlap[j]       = len(prev_set[i] & drawn_j) > 0
+    # Thay vi vong lap, ta tinh overlap tai moi j so voi prev_set cua chinh j
+    # (bang cach shift drawn_sets 1), roi lay rolling(30).mean() tren
+    # (hit_num & overlap_with_prev).
+    drawn_sets  = df.apply(get_drawn_set, axis=1)          # Series of sets
+    prev_sets   = drawn_sets.shift(1)                       # set cua ky truoc
+
+    # overlap_flag[j] = 1 neu drawn_sets[j] co chung voi prev_sets[j]
+    overlap_flag = pd.Series([
+        1.0 if (isinstance(ps, set) and len(drawn_sets.iloc[j] & ps) > 0) else 0.0
+        for j, ps in enumerate(prev_sets)
+    ], index=df.index)
+
+    # joint[j] = 1 neu so `num` xuat hien tai j VA co overlap voi anchor
+    joint = hit.astype(float) * overlap_flag
+
+    # rolling(30).mean() tren joint, shift 1 de tranh leak
+    pair_raw = joint.shift(1).rolling(30, min_periods=30).mean()
+    # Cac ky < 31 se la NaN tu dong (min_periods=30)
+    feat["n_pair_freq"] = pair_raw
 
     # dot_prev: dot (1/2) cua ky truoc
     if "dot" in df.columns:
@@ -655,7 +665,7 @@ def show_prediction(df: pd.DataFrame, proba_list: list,
       - [(num, prob, cvprec)] — ensemble
     """
     last_ky  = (df["ky"].iloc[-1] or "").strip()
-    next_ky  = f"(sau {last_ky})"
+    next_ky = f"{int(last_ky) + 1:05d} (sau {last_ky})"
     top      = proba_list[:top_k]
 
     print(f"\n{'═'*56}")
@@ -690,42 +700,69 @@ def show_prediction(df: pd.DataFrame, proba_list: list,
 # ─────────────────────────────────────────────
 
 def evaluate_history(df: pd.DataFrame, results: dict,
-                     top_k: int = 8, last_n: int = 50):
+                     top_k: int = 8, last_n: int = 50,
+                     lags: int = 3, train_window: int = 0,
+                     decay: float = 0.995, min_train: int = 200,
+                     val_size: int = 20, xgb_params: dict = None):
     """
-    Back-test tren last_n ky cuoi: moi ky chon top_k so,
-    so voi ket qua thuc te, tinh precision va hit count.
+    Back-test KHONG look-ahead bias: tai moi ky i, retrain model chi
+    dung data tu dau den i (khong nhin tuong lai), sau do predict ky i+1.
+
+    Tham so them so voi phien ban cu:
+      lags, train_window, decay, min_train, val_size, xgb_params
+      — truyen thang vao train_one, dam bao nhat quan voi final model.
+
+    Chi phi: cham hon phien ban cu (moi ky retrain 35 model) nhung
+    metric trung thuc hon — dung cho bao cao hieu nang that su.
+    Goi y: dung last_n <= 30 de kiem soat thoi gian chay.
     """
-    print(f"\n📊 Back-test {last_n} ky cuoi (top {top_k}):")
+    print(f"\n📊 Back-test KHONG look-ahead bias — {last_n} ky cuoi (top {top_k}):")
+    print(f"  ⚠️  Moi ky retrain 35 model → co the chay ~{last_n*2}-{last_n*5} giay")
     print(f"  {'Ky':<8}  {'Chon':^35}  {'Trung':>5}  {'Prec':>6}")
     print(f"  {'─'*65}")
 
     prec_list = []
     hit_list  = []
 
-    # Lay tung ky trong khoang back-test
     n_total = len(df)
-    start   = max(0, n_total - last_n - 1)
+    # Ky bat dau backtest: dam bao du min_train ky de train
+    start = max(min_train, n_total - last_n - 1)
+    if start >= n_total - 1:
+        print(f"  ⚠️  Khong du data de backtest (can it nhat {min_train+1} ky)")
+        return
 
     for i in range(start, n_total - 1):
-        ky_str  = (df["ky"].iloc[i] or "").strip()
-        actual  = get_drawn_set(df.iloc[i + 1])   # ket qua ky tiep theo
+        ky_str = (df["ky"].iloc[i] or "").strip()
+        actual = get_drawn_set(df.iloc[i + 1])   # ket qua ky tiep theo (chua biet luc train)
 
-        # Lay xac suat tung so tai thoi diem i (row i trong combined)
+        # Subset data: chi dung tu dau den ky i (inclusive) de train
+        df_sub = df.iloc[: i + 1].reset_index(drop=True)
+
+        # Build global features cho subset
+        gf_sub = make_global_features(df_sub, lags=lags)
+
         proba_i = []
         for num in ALL_NUMS:
-            r        = results[num]
-            combined = r["combined"]
-            feat_c   = r["feature_cols"]
-            model    = r["model"]
-
-            # Tim row trong combined tuong ung ky nay
-            mask = combined["ky"].astype(str).str.strip() == ky_str
-            if mask.sum() == 0:
+            # Build dataset: combined_train = iloc[:-1], predict_row = iloc[-1]
+            combined_sub, predict_row_sub, feat_cols = build_dataset(
+                df_sub, num, gf_sub, lags
+            )
+            if len(combined_sub) < min_train:
                 proba_i.append((num, 0.0))
                 continue
-            row_idx = combined[mask].index[0]
-            X_row   = combined.loc[[row_idx], feat_c].values
-            prob    = model.predict_proba(X_row)[0][1]
+
+            # Train chi tren data den ky i — khong nhin ky i+1
+            model_i, _, _ = train_one(
+                combined_sub, feat_cols,
+                val_size=val_size,
+                min_train=min_train,
+                train_window=train_window,
+                decay=decay,
+                xgb_params=xgb_params,
+            )
+            # predict_row_sub la features cua ky i → predict ky i+1
+            X_pred = predict_row_sub[feat_cols].values
+            prob   = model_i.predict_proba(X_pred)[0][1]
             proba_i.append((num, prob))
 
         proba_i.sort(key=lambda x: -x[1])
@@ -735,7 +772,6 @@ def evaluate_history(df: pd.DataFrame, results: dict,
         prec_list.append(prec)
         hit_list.append(len(hits))
 
-        # In moi 5 ky
         if (i - start) % 5 == 0 or i == n_total - 2:
             chosen_str = " ".join(f"{n:>2}" for n in sorted(chosen))
             print(
@@ -743,9 +779,13 @@ def evaluate_history(df: pd.DataFrame, results: dict,
                 f"  {len(hits):>5}  {prec:>6.1%}"
             )
 
+    if not prec_list:
+        print("  ⚠️  Khong co ky nao du dieu kien backtest")
+        return
+
     mean_prec = np.mean(prec_list)
     mean_hits = np.mean(hit_list)
-    baseline  = 5 / 35 * top_k / top_k   # = 14.3%
+    baseline  = 5 / 35   # = 14.3%
     lift      = mean_prec - baseline
     flag      = "✅" if lift > 0.02 else ("🟡" if lift > 0 else "⚠️ ")
 
@@ -1136,8 +1176,13 @@ def main():
         )
 
         if args.backtest > 0:
-            # Back-test dung model dau tien (don gian)
-            evaluate_history(df, all_results[0], top_k=args.top, last_n=args.backtest)
+            cfg0 = ENSEMBLE_CONFIGS[0]
+            evaluate_history(
+                df, all_results[0], top_k=args.top, last_n=args.backtest,
+                lags=cfg0["lags"], train_window=cfg0["train_window"],
+                decay=cfg0["decay"], min_train=args.min_train,
+                val_size=args.val_size, xgb_params=xgb_params,
+            )
 
         print(f"\n🔮 Predicting top {args.top} (ensemble + filter={args.filter:.0%})...")
         proba_list   = predict_top_k_ensemble(
@@ -1167,7 +1212,12 @@ def main():
         )
 
         if args.backtest > 0:
-            evaluate_history(df, results, top_k=args.top, last_n=args.backtest)
+            evaluate_history(
+                df, results, top_k=args.top, last_n=args.backtest,
+                lags=args.lags, train_window=args.train_window,
+                decay=args.decay, min_train=args.min_train,
+                val_size=args.val_size, xgb_params=xgb_params,
+            )
 
         print(f"\n🔮 Predicting top {args.top}...")
         proba_list = predict_top_k(df, global_feat, results, top_k=args.top)
