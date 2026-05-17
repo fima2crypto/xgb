@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse, os, warnings
+import joblib
 import numpy as np
 import pandas as pd
 from collections import Counter
@@ -665,7 +666,7 @@ def show_prediction(df: pd.DataFrame, proba_list: list,
       - [(num, prob, cvprec)] — ensemble
     """
     last_ky  = (df["ky"].iloc[-1] or "").strip()
-    next_ky = f"{int(last_ky) + 1:05d} (sau {last_ky})"
+    next_ky  = f"(sau {last_ky})"
     top      = proba_list[:top_k]
 
     print(f"\n{'═'*56}")
@@ -843,6 +844,103 @@ def optuna_tune(df: pd.DataFrame, global_feat: pd.DataFrame,
     for k, v in best.items():
         print(f"    {k:<25} = {v}")
     return best
+
+
+# ─────────────────────────────────────────────
+# 12a. SAVE / LOAD MODEL (joblib)
+# ─────────────────────────────────────────────
+
+def _model_path(path: str, version: str) -> str:
+    """
+    Tra ve duong dan file .pkl.
+    Neu path khong co extension, tu dong them '<version>.pkl'.
+    Vi du: 'models/' -> 'models/v1.3.0.pkl'
+    """
+    import os
+    if os.path.isdir(path) or path.endswith("/") or path.endswith(os.sep):
+        os.makedirs(path, exist_ok=True)
+        return os.path.join(path, f"{version}.pkl")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    return path
+
+
+def save_model(results: dict, df: pd.DataFrame, args, path: str):
+    """
+    Luu toan bo results (35 model + metadata) ra file .pkl bang joblib.
+
+    Noi dung luu:
+      - results  : dict num -> {model, prec, rec, feature_cols, ...}
+      - input_ky : ky cuoi cua data dung de train
+      - version  : VERSION string
+      - args_snapshot: cac tham so train chinh (lags, decay, train_window, ...)
+      - saved_at : timestamp UTC
+
+    Khong luu 'combined' (DataFrame lon) de giam kich thuoc file.
+    """
+    import joblib
+
+    fpath = _model_path(path, VERSION)
+
+    # Loai 'combined' (DataFrame) khoi moi num truoc khi luu
+    results_slim = {}
+    for num, r in results.items():
+        results_slim[num] = {k: v for k, v in r.items() if k != "combined"}
+
+    payload = {
+        "results"      : results_slim,
+        "input_ky"     : (df["ky"].iloc[-1] or "").strip(),
+        "n_rows"       : len(df),
+        "version"      : VERSION,
+        "saved_at"     : datetime.now(timezone.utc).isoformat(),
+        "args_snapshot": {
+            "lags"        : getattr(args, "lags", 3),
+            "decay"       : getattr(args, "decay", 0.995),
+            "train_window": getattr(args, "train_window", 0),
+            "min_train"   : getattr(args, "min_train", 200),
+            "val_size"    : getattr(args, "val_size", 20),
+            "top_k"       : getattr(args, "top", 8),
+            "ensemble"    : getattr(args, "ensemble", False),
+        },
+    }
+
+    joblib.dump(payload, fpath, compress=3)
+    size_mb = os.path.getsize(fpath) / 1024 / 1024
+    print(f"\n💾 Da luu model → {fpath}  ({size_mb:.1f} MB)")
+    print(f"   input_ky={payload['input_ky']}  version={VERSION}")
+
+
+def load_model(path: str) -> tuple:
+    """
+    Load model tu file .pkl.
+
+    Tra ve (results, payload) trong do:
+      - results : dict num -> {model, prec, rec, feature_cols, predict_row}
+                  Luu y: 'combined' KHONG co (da loai khi save).
+                  evaluate_history() can retrain nen khong can 'combined'.
+      - payload : toan bo dict goc (co metadata)
+
+    Raise FileNotFoundError neu file khong ton tai.
+    """
+    import joblib, os
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Khong tim thay model file: {path}")
+
+    payload = joblib.load(path)
+    results = payload["results"]
+
+    print(f"\n📂 Da load model ← {path}")
+    print(f"   version={payload.get('version')}  "
+          f"input_ky={payload.get('input_ky')}  "
+          f"saved_at={payload.get('saved_at', '')[:19]}")
+    snap = payload.get("args_snapshot", {})
+    print(f"   lags={snap.get('lags')}  decay={snap.get('decay')}  "
+          f"train_window={snap.get('train_window')}  "
+          f"min_train={snap.get('min_train')}")
+
+    precs = [results[n]["prec"] for n in ALL_NUMS if n in results]
+    print(f"   Mean CV prec (35 model): {np.mean(precs):.3f}")
+    return results, payload
 
 
 # ─────────────────────────────────────────────
@@ -1120,6 +1218,12 @@ def main():
                         help="Filter threshold CV_prec (mac dinh 0.12, 0=tat filter)")
     parser.add_argument("--tune",        action="store_true")
     parser.add_argument("--tune_trials", type=int, default=30)
+    parser.add_argument("--save_model",  default="",
+                        help="Luu 35 model ra file .pkl sau khi train. "
+                             "Vi du: --save_model models/  hoac --save_model my.pkl")
+    parser.add_argument("--load_model",  default="",
+                        help="Load model da train tu file .pkl, bo qua buoc train. "
+                             "Vi du: --load_model models/v1.3.0.pkl")
     args = parser.parse_args()
 
     # ── Mode: update result ──
@@ -1127,6 +1231,38 @@ def main():
         print(f"🔄 Update ket qua thuc te tu l535kqdetail...")
         update_result()
         return
+
+    # ── Mode: load model (bo qua train) ──
+    if args.load_model:
+        try:
+            results, payload = load_model(args.load_model)
+            snap = payload.get("args_snapshot", {})
+            # Lay lags tu snapshot de build global_feat dung
+            load_lags = snap.get("lags", args.lags)
+            global_feat = make_global_features(df, lags=load_lags)
+
+            # Rebuild predict_row cho tung so neu chua co
+            # (predict_row duoc luu san trong results_slim)
+            print(f"\n🔮 Predicting top {args.top} (tu model da load)...")
+            proba_list = predict_top_k(df, global_feat, results, top_k=args.top)
+
+            if args.filter > 0:
+                before = len(proba_list)
+                proba_list = [
+                    (n, p) for n, p in proba_list
+                    if results[n]["prec"] >= args.filter
+                ]
+                if len(proba_list) < before:
+                    print(f"  🔍 Filter {args.filter:.0%}: loai {before - len(proba_list)} so")
+
+            show_prediction(df, proba_list, top_k=args.top, results=results)
+            cv_prec_mean = np.mean([results[n]["prec"] for n in ALL_NUMS])
+
+            if args.save:
+                save_predict(args, df, proba_list, results, cv_prec_mean)
+            return
+        except FileNotFoundError as e:
+            print(f"  ⚠️  {e} — se train moi thay the.")
 
     # ── Mode: train + predict ──
     print(f"📌 Version : {VERSION}")
@@ -1194,6 +1330,9 @@ def main():
         cv_prec_mean = np.mean([all_results[0][n]["prec"] for n in ALL_NUMS])
         results      = all_results[0]   # dung cho save
 
+        if args.save_model:
+            save_model(results, df, args, args.save_model)
+
     else:
         # ── Single model mode ──
         global_feat = make_global_features(df, lags=args.lags)
@@ -1234,6 +1373,9 @@ def main():
 
         show_prediction(df, proba_list, top_k=args.top, results=results)
         cv_prec_mean = np.mean([results[n]["prec"] for n in ALL_NUMS])
+
+        if args.save_model:
+            save_model(results, df, args, args.save_model)
 
     # Save to DB
     if args.save:
