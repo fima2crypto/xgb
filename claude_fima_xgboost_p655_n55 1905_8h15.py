@@ -30,8 +30,6 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
 from sklearn.metrics import precision_score, recall_score
 from sklearn.utils.class_weight import compute_sample_weight
 
@@ -349,52 +347,6 @@ def make_xgb(params: dict = None):
     return XGBClassifier(**defaults)
 
 
-def make_lgbm(params: dict = None):
-    defaults = dict(
-        n_estimators          = 300,
-        max_depth             = 3,
-        learning_rate         = 0.05,
-        subsample             = 0.8,
-        colsample_bytree      = 0.7,
-        min_child_leaves      = 3,
-        reg_alpha             = 0.05,
-        reg_lambda            = 1.0,
-        scale_pos_weight      = 8,
-        objective             = "binary",
-        random_state          = 42,
-        n_jobs                = -1,
-        verbose               = -1,
-    )
-    if params:
-        defaults.update(params)
-    return LGBMClassifier(**defaults)
-
-
-def make_catboost(params: dict = None):
-    defaults = dict(
-        iterations            = 300,
-        depth                 = 3,
-        learning_rate         = 0.05,
-        subsample             = 0.8,
-        scale_pos_weight      = 8,
-        loss_function         = "Logloss",
-        random_seed           = 42,
-        thread_count          = -1,
-        verbose               = 0,
-    )
-    if params:
-        defaults.update(params)
-    return CatBoostClassifier(**defaults)
-
-
-def _make_model(model_type: str, params: dict = None):
-    if model_type == "lgbm":
-        return make_lgbm(params)
-    if model_type == "catboost":
-        return make_catboost(params)
-    return make_xgb(params)
-
-
 # ─────────────────────────────────────────────
 # 7. WALK-FORWARD
 # ─────────────────────────────────────────────
@@ -420,7 +372,6 @@ def _make_decay_weights(n: int, decay: float = 0.995) -> np.ndarray:
 def train_one(combined: pd.DataFrame, feature_cols: list,
               val_size: int, min_train: int,
               train_window: int = 0, decay: float = 0.995,
-              model_type: str = "xgb",
               xgb_params: dict = None) -> tuple:
     X = combined[feature_cols].values
     y = combined["y"].values
@@ -442,13 +393,9 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
         sw_decay = _make_decay_weights(len(y_tr), decay)
         sw_tr    = sw_bal * sw_decay
 
-        mdl = _make_model(model_type, xgb_params)
-        if model_type == "xgb":
-            mdl.fit(X_tr, y_tr, sample_weight=sw_tr,
-##                    eval_set=[(X_va, y_va)], verbose=False)
-                    eval_set=[(X_va, y_va)])
-        else:
-            mdl.fit(X_tr, y_tr, sample_weight=sw_tr)
+        mdl = make_xgb(xgb_params)
+        mdl.fit(X_tr, y_tr, sample_weight=sw_tr,
+                eval_set=[(X_va, y_va)], verbose=False)
         pred = mdl.predict(X_va)
         prec_list.append(precision_score(y_va, pred, zero_division=0))
         rec_list.append(recall_score(y_va, pred, zero_division=0))
@@ -464,15 +411,9 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
     sw_fin     = sw_bal_f * sw_decay_f
 
     final_p = dict(xgb_params or {})
-    if model_type == "xgb":
-        final_p["early_stopping_rounds"] = None
-    final = _make_model(model_type, final_p)
-    if model_type == "catboost":
-        final.fit(X_fin, y_fin, sample_weight=sw_fin, verbose=False)
-    elif model_type == "lgbm":
-        final.fit(X_fin, y_fin, sample_weight=sw_fin)
-    else:
-        final.fit(X_fin, y_fin, sample_weight=sw_fin)
+    final_p["early_stopping_rounds"] = None
+    final = make_xgb(final_p)
+    final.fit(X_fin, y_fin, sample_weight=sw_fin, verbose=False)
 
     mean_prec = float(np.mean(prec_list)) if prec_list else 0.0
     mean_rec  = float(np.mean(rec_list))  if rec_list  else 0.0
@@ -486,7 +427,6 @@ def train_one(combined: pd.DataFrame, feature_cols: list,
 def train_all(df: pd.DataFrame, global_feat: pd.DataFrame,
               lags: int, val_size: int, min_train: int,
               train_window: int = 0, decay: float = 0.995,
-              model_type: str = "xgb",
               xgb_params: dict = None,
               show_importance: bool = False) -> dict:
     """Train 55 model cho so chinh N1-N6."""
@@ -503,8 +443,7 @@ def train_all(df: pd.DataFrame, global_feat: pd.DataFrame,
         )
         model, prec, rec = train_one(
             combined_train, feature_cols,
-            val_size, min_train, train_window, decay,
-            model_type, xgb_params
+            val_size, min_train, train_window, decay, xgb_params
         )
         results[num] = dict(
             model=model, prec=prec, rec=rec,
@@ -556,11 +495,9 @@ def _show_top_importance(results: dict, top_n: int = 15):
 # ─────────────────────────────────────────────
 
 ENSEMBLE_CONFIGS = [
-    {"lags":3, "decay":0.995, "train_window":0,   "model_type":"xgb",      "label":"M1(xgb,lag3,d0.995,all)"},
-    {"lags":5, "decay":0.990, "train_window":0,   "model_type":"xgb",      "label":"M2(xgb,lag5,d0.990,all)"},
-    {"lags":3, "decay":0.995, "train_window":500, "model_type":"xgb",      "label":"M3(xgb,lag3,d0.995,w500)"},
-    {"lags":3, "decay":0.995, "train_window":0,   "model_type":"lgbm",     "label":"M4(lgbm,lag3,d0.995,all)"},
-    {"lags":3, "decay":0.995, "train_window":0,   "model_type":"catboost", "label":"M5(cat,lag3,d0.995,all)"},
+    {"lags":3, "decay":0.995, "train_window":0,   "label":"M1(lag3,d0.995,all)"},
+    {"lags":5, "decay":0.990, "train_window":0,   "label":"M2(lag5,d0.990,all)"},
+    {"lags":3, "decay":0.995, "train_window":500, "label":"M3(lag3,d0.995,w500)"},
 ]
 
 def train_ensemble(df: pd.DataFrame, val_size: int, min_train: int,
@@ -573,7 +510,6 @@ def train_ensemble(df: pd.DataFrame, val_size: int, min_train: int,
             df, gf,
             lags=cfg["lags"], val_size=val_size, min_train=min_train,
             train_window=cfg["train_window"], decay=cfg["decay"],
-            model_type=cfg.get("model_type", "xgb"),
             xgb_params=xgb_params, show_importance=False,
         )
         all_results.append(r)

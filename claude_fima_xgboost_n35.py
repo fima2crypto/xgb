@@ -12,11 +12,21 @@ Kien truc:
 Features (no-leak, shift >= 1):
   A. Lich: thu, dot (biet truoc)
   B. Per-number history: last_seen, freq_20, freq_50, is_qhl
-  C. Global L535: sc, sum, dd_enc, cl5_l_count, dec0, dec3 (lag 1-lags)
-  D. Rolling global: sc, cl5_l_count (window 3, 5)
-  E. Mega/Power: mg_dd, pw_dd, cross features
+  C. Global L535: sc, sum, dd_enc, cl5_b0..b4, cl5_pattern, cl5_changed,
+                  dec0, dec3 (lag 1-lags)
+     [v1.4.0] Bo cl5_l_count (= 5 - sc, redundant). Them cl5_b0..b4 (5 bit
+              rieng), cl5_changed (pattern doi so voi ky truoc).
+  D. Rolling global: sc (window 3, 5)
+     [v1.4.0] Bo cl5_l_count_roll* (redundant).
+  E. Mega/Power: mg_dd, pw_dd, pw_sc, cross features
+     [v1.4.0] Them pw_sc (dem so chan cua ky Power gan nhat).
   F. JP: jpck, is_jp
   G. Sliding window + Time decay weight
+  H. [v1.4.0] scale_pos_weight=7 trong XGB (5/35 ~ 14.3% positive).
+
+Changelog:
+  v1.4.0 — Bo cl5_l_count (redundant voi sc). Them cl5_b0..b4, cl5_changed,
+            pw_sc. scale_pos_weight=7. Cross: them cross_sc_pw.
 
 Usage:
     python claude_fima_xgboost_n35.py --source db --lags 3 --top 8
@@ -46,11 +56,11 @@ DATABASE_URL = os.environ.get(
 ALL_NUMS = list(range(1, 36))   # 1-35
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION     = "v1.3.0"
+VERSION     = "v1.4.0"
 DESCRIPTION = (
     "35 binary XGBoost (n1-n5), no-leak train/predict split, "
-    "sliding window + time decay weight, Mega/Power cross features, "
-    "walk-forward CV, save to l535kqpredict"
+    "sliding window + time decay, Mega/Power cross+pw_sc features, "
+    "cl5 bit-encode, scale_pos_weight, walk-forward CV, save to l535kqpredict"
 )
 
 # ─────────────────────────────────────────────
@@ -119,28 +129,46 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     Tinh cac feature GLOBAL (khong phu thuoc vao so cu the).
     Tat ca shift >= 1 de tranh data leak.
     Tra ve DataFrame co cung index voi df.
+
+    v1.4.0 changes:
+      - Bo cl5_l_count (= 5 - sc, du thua tuyen tinh).
+      - Them cl5_b0..b4: 5 bit C/L rieng cho tung vi tri (port tu M645).
+      - Them cl5_changed: pattern cl5 co doi so voi ky truoc khong.
+      - Them pw_sc: dem so chan trong ky Power gan nhat (port tu M645).
+      - Rolling D: chi giu sc_roll*, bo cl5_l_count_roll* (du thua).
+      - Cross G: them cross_sc_pw (sc_prev * pw_sc).
     """
     d = df.copy()
 
-    # ── Encode global ──
+    # ── Encode DD (N1 va N5) ──
     d["dd_enc"] = d["dd"].apply(
         lambda v: {"CC": 0, "CL": 1, "LC": 2, "LL": 3}.get(str(v).strip(), -1)
     )
+
+    # ── CL5: 5 bit rieng + pattern + changed ──
     s = d["cl5"].astype(str).str.strip()
-    d["cl5_l_count"] = s.apply(
-        lambda v: sum(1 for c in v if c == "L") if len(v) == 5 else np.nan
-    )
+    for i in range(5):
+        d[f"cl5_b{i}"] = s.str[i].map({"C": 0, "L": 1}).fillna(-1).astype(int)
     d["cl5_pattern"] = s.apply(
-        lambda v: int("".join("0" if c=="C" else "1" for c in v), 2)
+        lambda v: int("".join("0" if c == "C" else "1" for c in v), 2)
         if len(v) == 5 else np.nan
     )
+    d["cl5_changed"] = (d["cl5_pattern"] != d["cl5_pattern"].shift(1)).astype(float)
+
+    # ── Thu / dot ──
     d["thu_enc"] = _encode_thu(d["thu"])
     d["dot"]     = pd.to_numeric(d["dot"], errors="coerce").fillna(0).astype(int)
 
+    # ── JP ──
     if "jpck" in d.columns:
         d["jpck"] = pd.to_numeric(d["jpck"], errors="coerce").fillna(0)
     if "is_jp" in d.columns:
         d["is_jp_enc"] = d["is_jp"].astype(int)
+
+    # ── Power sc (dem so chan trong ky Power) ──
+    if all(c in d.columns for c in [f"pwn{i}" for i in range(1, 6)]):
+        pn = [_safe_int(d[f"pwn{i}"]) for i in range(1, 6)]
+        d["pw_sc"] = sum((n % 2 == 0).astype(float) for n in pn)
 
     feat = pd.DataFrame(index=d.index)
 
@@ -149,7 +177,12 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     feat["dot"]     = d["dot"]
 
     # B. Global L535 ky truoc (shift 1)
-    prev_cols = ["dd_enc", "sc", "sum", "cl5_l_count", "cl5_pattern", "dec0", "dec3"]
+    prev_cols = [
+        "dd_enc", "sc", "sum",
+        "cl5_b0", "cl5_b1", "cl5_b2", "cl5_b3", "cl5_b4",
+        "cl5_pattern", "cl5_changed",
+        "dec0", "dec3",
+    ]
     for c in ["jpck", "is_jp_enc"]:
         if c in d.columns:
             prev_cols.append(c)
@@ -157,20 +190,19 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     for col in prev_cols:
         feat[f"{col}_prev"] = d[col].shift(1)
 
-    # C. Lag 2 → lags
-    lag_cols = ["dd_enc", "sc", "cl5_l_count", "cl5_pattern"]
+    # C. Lag 2 → lags (chi dd_enc, sc, cl5_pattern — bo cl5_l_count)
+    lag_cols = ["dd_enc", "sc", "cl5_pattern"]
     lag_cols = [c for c in lag_cols if c in d.columns]
     for lag in range(2, lags + 1):
         for col in lag_cols:
             feat[f"{col}_lag{lag}"] = d[col].shift(lag)
 
-    # D. Rolling (window 3, 5)
+    # D. Rolling window 3, 5 — chi sc (bo cl5_l_count_roll*, redundant)
     for w in [3, 5]:
-        for col in ["sc", "cl5_l_count"]:
-            if col in d.columns:
-                base = d[col].shift(1)
-                feat[f"{col}_roll{w}_mean"] = base.rolling(w).mean()
-                feat[f"{col}_roll{w}_std"]  = base.rolling(w).std()
+        if "sc" in d.columns:
+            base = d["sc"].shift(1)
+            feat[f"sc_roll{w}_mean"] = base.rolling(w).mean()
+            feat[f"sc_roll{w}_std"]  = base.rolling(w).std()
 
     # E. Mega features
     if all(c in d.columns for c in ["mgn1", "mgn6"]):
@@ -189,6 +221,8 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
         if "pwngay" in d.columns:
             feat["pw_ngay_diff"] = _ngay_diff(d["ngay"], d["pwngay"])
         feat["pw_dd"] = _encode_dd(pn[0], pn[5])
+    if "pw_sc" in d.columns:
+        feat["pw_sc"] = d["pw_sc"]
 
     # G. Cross features
     if "mg_dd" in feat.columns and "dd_enc_prev" in feat.columns:
@@ -203,6 +237,8 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
         feat["cross_sc_mg_dd"] = feat["sc_prev"] * feat["mg_dd"]
     if "pw_dd" in feat.columns and "sc_prev" in feat.columns:
         feat["cross_sc_pw_dd"] = feat["sc_prev"] * feat["pw_dd"]
+    if "pw_sc" in feat.columns and "sc_prev" in feat.columns:
+        feat["cross_sc_pw"] = feat["sc_prev"] * feat["pw_sc"]
 
     return feat
 
@@ -361,6 +397,7 @@ def make_xgb(params: dict = None):
         gamma                 = 1,
         reg_alpha             = 0.1,
         reg_lambda            = 2.0,
+        scale_pos_weight      = 7,        # L535: ~5/35 ~ 14.3% positive
         objective             = "binary:logistic",
         eval_metric           = "logloss",
         random_state          = 42,
