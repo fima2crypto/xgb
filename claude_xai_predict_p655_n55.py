@@ -1,5 +1,5 @@
 """
-claude_fima_xgboost_p655_n55.py
+claude_xai_predict_p655_n55.py
 ────────────────────────────────
 Du doan P655:
   - 55 model nhi phan cho N1-N6 (6 so chinh, range 1-55) → chon top 8
@@ -17,10 +17,10 @@ Kien truc:
 Cross-ref: chi dung Mega M645 (bo Lotto do it overlap).
 
 Usage:
-    python claude_fima_xgboost_p655_n55.py --source db --lags 3 --top 8
-    python claude_fima_xgboost_p655_n55.py --source db --top 8 --ensemble --filter 0.10
-    python claude_fima_xgboost_p655_n55.py --source db --top 8 --ensemble --filter 0.10 --save
-    python claude_fima_xgboost_p655_n55.py --update_result
+    python claude_xai_predict_p655_n55.py --source db --lags 3 --top 8
+    python claude_xai_predict_p655_n55.py --source db --top 10 --ensemble --filter 0.10
+    python claude_xai_predict_p655_n55.py --source db --top 10 --ensemble --filter 0.10 --save
+    python claude_xai_predict_p655_n55.py --update_result
 """
 
 import argparse, os, warnings
