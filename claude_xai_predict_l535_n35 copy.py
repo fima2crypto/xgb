@@ -1,25 +1,27 @@
 """
-claude_xai_predict_p655_n55.py
+claude_xai_predict_l535_n35.py
 ────────────────────────────────
-Du doan P655:
-  - 55 model nhi phan cho N1-N6 (6 so chinh, range 1-55) → chon top K
+Du doan L535:
+  - 35 model nhi phan cho N1-N5 (5 so chinh, range 1-35) → chon top K
+  - N6 (so phu): bo qua
 
 Kien truc:
-  - XGBoost / LightGBM binary classifier / so (55 model)
+  - XGBoost / LightGBM / CatBoost binary classifier (35 model)
   - Walk-forward CV: precision toi uu qua F-beta(0.5) threshold tuning
   - No data leak: train (ky 0→N-2), predict_row (ky N-1)
   - Sliding window + time decay weight
-  - Imbalance: compute_sample_weight("balanced") * decay (no scale_pos_weight)
-  - Co-occurrence vectorized thay n_pair_freq
+  - Imbalance: compute_sample_weight("balanced") * decay
+  - Co-occurrence vectorized
+  - pwn1-pwn7 (Power 655 truoc ky) dung lam feature
   - Ensemble 5 configs, weight theo softmax(mean_prec), loai config beat_ratio < 14%
-  - Majority-vote filter: so phai beat baseline o >= maj_min active configs
+  - Majority-vote filter
   - Brier score chi de monitor
-  - Save predict → p655kqpredict
+  - Save predict → l535kqpredict
 
 Usage:
-    python claude_xai_predict_p655_n55.py --source db --lags 3 --top 8
-    python claude_xai_predict_p655_n55.py --source db --top 10 --ensemble --filter auto --save
-    python claude_xai_predict_p655_n55.py --update_result
+    python claude_xai_predict_l535_n35.py --source db --lags 3 --top 8
+    python claude_xai_predict_l535_n35.py --source db --top 10 --ensemble --filter auto --save
+    python claude_xai_predict_l535_n35.py --update_result
 """
 
 import argparse, os, warnings
@@ -40,19 +42,19 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres:bin@localhost:5432/katalott"
 )
 
-ALL_NUMS = list(range(1, 56))
-N_MAIN   = 6
-N_POOL   = 55
+ALL_NUMS = list(range(1, 36))
+N_MAIN   = 5   # so chinh N1-N5
+N_POOL   = 35
 
-VERSION     = "v1.3.0"
+VERSION     = "v1.1.0"
 DESCRIPTION = (
-    "55 binary classifier (XGB/LGBM), no-leak split, vectorized features, "
-    "balanced sample_weight, F-beta lag-1 threshold (no eval leak), "
-    "hypergeometric baseline, weighted ensemble softmax, "
-    "majority-vote filter, save to p655kqpredict"
+    "35 binary classifier (XGB/LGBM/CatBoost), no-leak split, vectorized features, "
+    "balanced sample_weight, F-beta lag-1 threshold, "
+    "hypergeometric baseline (5/35), weighted ensemble softmax, "
+    "majority-vote filter, pwn1-7 features, save to l535kqpredict"
 )
 
-ENSEMBLE_MIN_BEAT_RATIO = 8 / 55   # ~14%: config bi loai neu beat_ratio < nguong
+ENSEMBLE_MIN_BEAT_RATIO = 6 / 35   # ~17.1%: config bi loai neu beat_ratio < nguong
 
 
 # ─────────────────────────────────────────────
@@ -62,7 +64,7 @@ ENSEMBLE_MIN_BEAT_RATIO = 8 / 55   # ~14%: config bi loai neu beat_ratio < nguon
 def hypergeometric_baseline(top_k: int,
                              n_drawn: int = N_MAIN,
                              pool: int = N_POOL) -> float:
-    return n_drawn / pool   # E[hits]/top_k = 6/55 ≈ 0.1091
+    return n_drawn / pool   # E[hits]/top_k = 5/35 ≈ 0.1429
 
 
 # ─────────────────────────────────────────────
@@ -73,7 +75,7 @@ def load_from_db(n_ky: int = 0, qh_ky: int = 20) -> pd.DataFrame:
     import psycopg2
     limit = f"LIMIT {n_ky}" if n_ky > 0 else ""
     sql = f"""
-        SELECT * FROM public.p655kqdetail
+        SELECT * FROM public.l535kqdetail
         WHERE qh_ky = {qh_ky}
         ORDER BY ky DESC {limit}
     """
@@ -116,20 +118,23 @@ def _ngay_diff(d1: pd.Series, d2: pd.Series) -> pd.Series:
             pd.to_datetime(d2, errors="coerce")).dt.days
 
 def get_drawn_set(row) -> set:
+    """Chi lay N1-N5 (so chinh)."""
     return {
-        int(row[c]) for c in ["n1", "n2", "n3", "n4", "n5", "n6"]
+        int(row[c]) for c in ["n1", "n2", "n3", "n4", "n5"]
         if pd.notna(row[c]) and row[c] != 0
     }
 
 
 # ─────────────────────────────────────────────
 # 3. HIT MATRIX & CO-OCCURRENCE (vectorized)
+#    Chi tinh tren N1-N5 (so chinh), bo N6
 # ─────────────────────────────────────────────
 
 def build_hit_matrix(df: pd.DataFrame) -> np.ndarray:
+    """Hit matrix chi cho so chinh N1-N5."""
     n   = len(df)
     mat = np.zeros((n, N_POOL + 1), dtype=np.int8)
-    for col in ["n1", "n2", "n3", "n4", "n5", "n6"]:
+    for col in ["n1", "n2", "n3", "n4", "n5"]:   # bo n6
         if col not in df.columns:
             continue
         vals = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).values
@@ -153,20 +158,23 @@ def build_cooccurrence_matrix(hit_mat: np.ndarray) -> np.ndarray:
 def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
     d = df.copy()
 
+    # dd encode
     d["dd_enc"] = d["dd"].apply(
         lambda v: {"CC": 0, "CL": 1, "LC": 2, "LL": 3}.get(str(v).strip(), -1)
     )
 
-    s = d["cl6"].astype(str).str.strip()
-    for i in range(6):
-        d[f"cl6_b{i}"] = s.str[i].map({"C": 0, "L": 1}).fillna(-1).astype(int)
-    d["cl6_pattern"] = s.apply(
+    # cl5: 5 bit chan/le cua 5 so chinh
+    s = d["cl5"].astype(str).str.strip()
+    for i in range(5):
+        d[f"cl5_b{i}"] = s.str[i].map({"C": 0, "L": 1}).fillna(-1).astype(int)
+    d["cl5_pattern"] = s.apply(
         lambda v: int("".join("0" if c == "C" else "1" for c in v), 2)
-        if len(v) == 6 else np.nan
+        if len(v) == 5 else np.nan
     )
-    d["cl6_changed"] = (d["cl6_pattern"] != d["cl6_pattern"].shift(1)).astype(float)
+    d["cl5_changed"] = (d["cl5_pattern"] != d["cl5_pattern"].shift(1)).astype(float)
 
-    num_cols = ["n1", "n2", "n3", "n4", "n5", "n6"]
+    # stats so chinh N1-N5
+    num_cols = ["n1", "n2", "n3", "n4", "n5"]
     nums_df  = df[num_cols].apply(pd.to_numeric, errors="coerce")
     d["drawn_min"]    = nums_df.min(axis=1)
     d["drawn_max"]    = nums_df.max(axis=1)
@@ -179,40 +187,89 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
         ), axis=1
     ).astype(float)
 
+    # dec0-dec3 (pool 35: thap phan 0-3)
+    for di in range(4):
+        col = f"dec{di}"
+        if col in d.columns:
+            d[col] = _safe_int(d[col])
+
     d["thu_enc"] = _encode_thu(d["thu"])
 
     if "jpck" in d.columns:
         d["jpck"] = _safe_int(d["jpck"]).fillna(0)
-    if "jp1_cnt" in d.columns:
-        d["jp1_enc"] = (_safe_int(d["jp1_cnt"]) > 0).astype(int)
 
-    if all(c in d.columns for c in ["mgn1", "mgn6"]):
-        mn = [_safe_int(d[f"mgn{i}"]) for i in range(1, 7)]
+
+
+    # Power 655 truoc ky (pwn1-pwn6, bo pwn7) → features
+    pw_cols  = [f"pwn{i}" for i in range(1, 7)]
+    pw_avail = [c for c in pw_cols if c in d.columns]
+    if pw_avail:
+        pw_nums = df[pw_avail].apply(pd.to_numeric, errors="coerce")
+        d["pw_min"]     = pw_nums.min(axis=1)
+        d["pw_max"]     = pw_nums.max(axis=1)
+        d["pw_range"]   = d["pw_max"] - d["pw_min"]
+        d["pw_sc"]      = (pw_nums % 2 == 0).sum(axis=1).astype(float)
+        d["pw_sum"]     = pw_nums.sum(axis=1)
+        d["pw_in_pool"] = (pw_nums <= N_POOL).sum(axis=1).astype(float)
+        l535_main = df[["n1","n2","n3","n4","n5"]].apply(pd.to_numeric, errors="coerce")
+        def _pw_overlap(row_idx):
+            pw_set = set(pw_nums.iloc[row_idx].dropna().astype(int).tolist())
+            l5_set = set(l535_main.iloc[row_idx].dropna().astype(int).tolist())
+            return float(len(pw_set & l5_set))
+        d["pw_l535_overlap"] = [_pw_overlap(i) for i in range(len(d))]
+
+    # Mega (mgn1-mgn6) → features
+    mg_cols  = [f"mgn{i}" for i in range(1, 7)]
+    mg_avail = [c for c in mg_cols if c in d.columns]
+    if mg_avail:
+        mg_nums = df[mg_avail].apply(pd.to_numeric, errors="coerce")
+        d["mg_min"]     = mg_nums.min(axis=1)
+        d["mg_max"]     = mg_nums.max(axis=1)
+        d["mg_range"]   = d["mg_max"] - d["mg_min"]
+        d["mg_sc"]      = (mg_nums % 2 == 0).sum(axis=1).astype(float)
+        d["mg_sum"]     = mg_nums.sum(axis=1)
+        d["mg_in_pool"] = (mg_nums <= N_POOL).sum(axis=1).astype(float)
         if "mgthu" in d.columns:
             d["mg_thu_enc"]   = _encode_thu(d["mgthu"])
         if "mgngay" in d.columns and "ngay" in d.columns:
             d["mg_ngay_diff"] = _ngay_diff(d["ngay"], d["mgngay"])
-        d["mg_dd"] = _encode_dd(mn[0], mn[5])
-        d["mg_sc"] = sum((n % 2 == 0).astype(float) for n in mn)
+        l535_main = df[["n1","n2","n3","n4","n5"]].apply(pd.to_numeric, errors="coerce")
+        def _mg_overlap(row_idx):
+            mg_set = set(mg_nums.iloc[row_idx].dropna().astype(int).tolist())
+            l5_set = set(l535_main.iloc[row_idx].dropna().astype(int).tolist())
+            return float(len(mg_set & l5_set))
+        d["mg_l535_overlap"] = [_mg_overlap(i) for i in range(len(d))]
 
+    # Build feat DataFrame
     feat = pd.DataFrame(index=d.index)
     feat["thu_enc"] = d["thu_enc"]
 
     prev_cols = [
         "dd_enc", "sc", "sum", "ke",
-        "cl6_b0", "cl6_b1", "cl6_b2", "cl6_b3", "cl6_b4", "cl6_b5",
-        "cl6_pattern", "cl6_changed",
-        "dec0", "dec1", "dec2", "dec3", "dec4", "dec5",
+        "cl5_b0", "cl5_b1", "cl5_b2", "cl5_b3", "cl5_b4",
+        "cl5_pattern", "cl5_changed",
+        "dec0", "dec1", "dec2", "dec3",
         "drawn_min", "drawn_max", "drawn_range", "drawn_consec",
     ]
-    for c in ["jpck", "jp1_enc"]:
+    for c in ["jpck"]:
         if c in d.columns:
             prev_cols.append(c)
+    # pw features (Power pwn1-pwn6)
+    for c in ["pw_min", "pw_max", "pw_range", "pw_sc", "pw_sum",
+              "pw_in_pool", "pw_l535_overlap"]:
+        if c in d.columns:
+            prev_cols.append(c)
+    # mg features (Mega mgn1-mgn6)
+    for c in ["mg_min", "mg_max", "mg_range", "mg_sc", "mg_sum",
+              "mg_in_pool", "mg_l535_overlap", "mg_thu_enc", "mg_ngay_diff"]:
+        if c in d.columns:
+            prev_cols.append(c)
+
     prev_cols = [c for c in prev_cols if c in d.columns]
     for col in prev_cols:
         feat[f"{col}_prev"] = d[col].shift(1)
 
-    lag_cols = ["dd_enc", "sc", "cl6_pattern", "drawn_range"]
+    lag_cols = ["dd_enc", "sc", "cl5_pattern", "drawn_range"]
     lag_cols = [c for c in lag_cols if c in d.columns]
     for lag in range(2, lags + 1):
         for col in lag_cols:
@@ -230,14 +287,27 @@ def make_global_features(df: pd.DataFrame, lags: int = 3) -> pd.DataFrame:
         sc_s = d["sc"].shift(1)
         feat["sc_trend"] = sc_s.rolling(5).mean() - sc_s.rolling(10).mean()
 
-    for c in ["mg_thu_enc", "mg_ngay_diff", "mg_dd", "mg_sc"]:
-        if c in d.columns:
-            feat[c] = d[c]
+    # Cross Power vs L535
+    if "pw_sc_prev" in feat.columns and "sc_prev" in feat.columns:
+        feat["cross_sc_pw"] = feat["sc_prev"] * feat["pw_sc_prev"]
+    if "pw_in_pool_prev" in feat.columns and "drawn_range_prev" in feat.columns:
+        feat["cross_pw_pool_range"] = feat["pw_in_pool_prev"] * feat["drawn_range_prev"]
+    if "pw_l535_overlap_prev" in feat.columns and "sc_prev" in feat.columns:
+        feat["cross_pw_overlap_sc"] = feat["pw_l535_overlap_prev"] * feat["sc_prev"]
 
-    if "mg_dd" in feat.columns and "dd_enc_prev" in feat.columns:
-        feat["cross_mg_dd_match"] = (feat["mg_dd"] == feat["dd_enc_prev"]).astype(float)
-    if "mg_sc" in feat.columns and "sc_prev" in feat.columns:
-        feat["cross_sc_mg"] = feat["sc_prev"] * feat["mg_sc"]
+    # Cross Mega vs L535
+    if "mg_sc_prev" in feat.columns and "sc_prev" in feat.columns:
+        feat["cross_sc_mg"] = feat["sc_prev"] * feat["mg_sc_prev"]
+    if "mg_in_pool_prev" in feat.columns and "drawn_range_prev" in feat.columns:
+        feat["cross_mg_pool_range"] = feat["mg_in_pool_prev"] * feat["drawn_range_prev"]
+    if "mg_l535_overlap_prev" in feat.columns and "sc_prev" in feat.columns:
+        feat["cross_mg_overlap_sc"] = feat["mg_l535_overlap_prev"] * feat["sc_prev"]
+
+    # Cross Power vs Mega
+    if "pw_sc_prev" in feat.columns and "mg_sc_prev" in feat.columns:
+        feat["cross_pw_mg_sc"] = feat["pw_sc_prev"] * feat["mg_sc_prev"]
+    if "pw_l535_overlap_prev" in feat.columns and "mg_l535_overlap_prev" in feat.columns:
+        feat["cross_pw_mg_overlap"] = feat["pw_l535_overlap_prev"] * feat["mg_l535_overlap_prev"]
 
     return feat
 
@@ -273,10 +343,10 @@ def make_per_number_features(df: pd.DataFrame,
     feat["n_streak"] = pd.Series(streak, index=df.index).shift(1)
 
     hit_s = pd.Series(hit, index=df.index).shift(1)
-    feat["n_freq_10"]   = hit_s.rolling(10).mean()
-    feat["n_freq_20"]   = hit_s.rolling(20).mean()
-    feat["n_freq_50"]   = hit_s.rolling(50).mean()
-    feat["n_freq_trend"]= hit_s.rolling(10).mean() - hit_s.rolling(30).mean()
+    feat["n_freq_10"]    = hit_s.rolling(10).mean()
+    feat["n_freq_20"]    = hit_s.rolling(20).mean()
+    feat["n_freq_50"]    = hit_s.rolling(50).mean()
+    feat["n_freq_trend"] = hit_s.rolling(10).mean() - hit_s.rolling(30).mean()
 
     gap_mean = np.full(n, np.nan)
     gap_std  = np.full(n, np.nan)
@@ -293,7 +363,8 @@ def make_per_number_features(df: pd.DataFrame,
     feat["n_gap_mean"] = pd.Series(gap_mean, index=df.index).shift(1)
     feat["n_gap_std"]  = pd.Series(gap_std,  index=df.index).shift(1)
 
-    for pos_i, col in enumerate(["n1", "n2", "n3", "n4", "n5", "n6"], 1):
+    # Position frequency trong N1-N5
+    for pos_i, col in enumerate(["n1", "n2", "n3", "n4", "n5"], 1):
         if col in df.columns:
             pos_hit = (pd.to_numeric(df[col], errors="coerce") == num).astype(float)
             feat[f"n_pos{pos_i}_freq"] = pos_hit.shift(1).rolling(50).mean()
@@ -315,16 +386,14 @@ def make_per_number_features(df: pd.DataFrame,
                 return 0.0
         feat["n_is_qhl"] = df["qhl"].shift(1).apply(_in_qhl)
 
-    if "n7" in df.columns:
-        n7_hit   = (pd.to_numeric(df["n7"], errors="coerce") == num).astype(int).values
-        n7_last  = np.full(n, np.nan)
-        last_n7i = -1
-        for i in range(n):
-            if last_n7i >= 0:
-                n7_last[i] = i - last_n7i
-            if n7_hit[i] == 1:
-                last_n7i = i
-        feat["n7_last_lag"] = pd.Series(n7_last, index=df.index).shift(1)
+    # Power 655: so num co xuat hien trong pwn1-pwn7 ky truoc khong
+    pw_cols = [f"pwn{i}" for i in range(1, 8)]
+    pw_avail = [c for c in pw_cols if c in df.columns]
+    if pw_avail:
+        pw_nums = df[pw_avail].apply(pd.to_numeric, errors="coerce")
+        pw_hit  = pw_nums.apply(lambda row: float(num in row.dropna().astype(int).tolist()), axis=1)
+        feat["n_in_pw_prev"]      = pw_hit.shift(1)
+        feat["n_in_pw_freq10"]    = pw_hit.shift(1).rolling(10).mean()
 
     if "dot" in df.columns:
         feat["dot_prev"] = _safe_int(df["dot"]).shift(1)
@@ -432,10 +501,6 @@ def _make_decay_weights(n: int, decay: float = 0.995) -> np.ndarray:
 
 def _best_threshold_fbeta(y_true: np.ndarray, y_prob: np.ndarray,
                            beta: float = 0.5) -> float:
-    """
-    Tim threshold maximize F-beta(0.5) tren val set.
-    beta < 1 → uu tien precision hon recall.
-    """
     if y_true.sum() == 0:
         return 0.5
     candidates  = np.unique(y_prob)
@@ -467,14 +532,6 @@ def train_one(combined: pd.DataFrame,
               decay: float = 0.995,
               model_type: str = "xgb",
               xgb_params: dict = None) -> tuple:
-    """
-    Tra ve (final_model, best_threshold, mean_cv_precision, mean_cv_recall, mean_brier).
-    - sample_weight = balanced * decay.
-    - Threshold: lag-1 strategy — threshold tu fold i dung de evaluate fold i+1.
-      Tranh leak: khong dung threshold tim tren chinh val set de evaluate no.
-    - best_thresh = threshold cua fold cuoi → dung khi predict.
-    - Brier chi de monitor.
-    """
     X = combined[feature_cols].values
     y = combined["y"].values
 
@@ -484,7 +541,7 @@ def train_one(combined: pd.DataFrame,
     brier_list  = []
     thresh_list = []
 
-    prev_thresh = 0.5   # fold dau tien dung 0.5 (chua co threshold truoc)
+    prev_thresh = 0.5
 
     for tr_idx, va_idx in splits:
         X_tr, X_va = X[tr_idx], X[va_idx]
@@ -508,17 +565,15 @@ def train_one(combined: pd.DataFrame,
 
         prob_va = mdl.predict_proba(X_va)[:, 1]
 
-        # Evaluate bang threshold cua fold TRUOC (lag-1, khong leak)
         pred = (prob_va >= prev_thresh).astype(int)
         prec_list.append(precision_score(y_va, pred, zero_division=0))
         rec_list.append(recall_score(y_va, pred, zero_division=0))
         brier_list.append(brier_score_loss(y_va, prob_va))
 
-        # Tim threshold toi uu cho fold TIEP THEO
         prev_thresh = _best_threshold_fbeta(y_va, prob_va, beta=0.5)
         thresh_list.append(prev_thresh)
 
-    # ── Final model (full data, no early stopping) ──
+    # Final model
     if train_window > 0 and len(X) > train_window:
         X_fin, y_fin = X[-train_window:], y[-train_window:]
     else:
@@ -534,17 +589,16 @@ def train_one(combined: pd.DataFrame,
     else:
         final.fit(X_fin, y_fin, sample_weight=sw_fin)
 
-    mean_prec   = float(np.mean(prec_list))   if prec_list   else 0.0
-    mean_rec    = float(np.mean(rec_list))    if rec_list    else 0.0
-    mean_brier  = float(np.mean(brier_list))  if brier_list  else 1.0
-    # best_thresh = threshold cua fold cuoi → dung cho predict ky tiep theo
-    best_thresh = float(thresh_list[-1])      if thresh_list else 0.5
+    mean_prec  = float(np.mean(prec_list))  if prec_list  else 0.0
+    mean_rec   = float(np.mean(rec_list))   if rec_list   else 0.0
+    mean_brier = float(np.mean(brier_list)) if brier_list else 1.0
+    best_thresh = float(thresh_list[-1])    if thresh_list else 0.5
 
     return final, best_thresh, mean_prec, mean_rec, mean_brier
 
 
 # ─────────────────────────────────────────────
-# 11. TRAIN ALL (55 models)
+# 11. TRAIN ALL (35 models)
 # ─────────────────────────────────────────────
 
 def train_all(df: pd.DataFrame,
@@ -563,7 +617,7 @@ def train_all(df: pd.DataFrame,
     results  = {}
     baseline = hypergeometric_baseline(top_k=8)
 
-    print(f"\n  [N1-N6] Hypergeometric baseline precision: {baseline:.4f} ({baseline:.1%})")
+    print(f"\n  [N1-N5] Hypergeometric baseline precision: {baseline:.4f} ({baseline:.1%})")
     print(f"  {'Num':>4}  {'CV Prec':>8}  {'CV Rec':>8}  {'Brier':>8}  {'Thresh':>7}  {'Flag'}")
     print(f"  {'─'*58}")
 
@@ -589,7 +643,7 @@ def train_all(df: pd.DataFrame,
     briers = [results[n]["brier"] for n in ALL_NUMS]
     print(f"\n  Mean CV Precision : {np.mean(precs):.4f}")
     print(f"  Mean Brier Score  : {np.mean(briers):.4f}  (monitor only, naive={N_MAIN/N_POOL*(1-N_MAIN/N_POOL):.4f})")
-    print(f"  Beat baseline     : {sum(1 for p in precs if p > baseline)}/55")
+    print(f"  Beat baseline     : {sum(1 for p in precs if p > baseline)}/35")
 
     if show_importance:
         _show_top_importance(results)
@@ -612,9 +666,9 @@ def _show_top_importance(results: dict, top_n: int = 15):
         for c, v in zip(r["feature_cols"], imps):
             imp_sum[c] = imp_sum.get(c, 0.0) + v
 
-    imp_avg = {k: v / 55 for k, v in imp_sum.items()}
+    imp_avg = {k: v / 35 for k, v in imp_sum.items()}
     top     = sorted(imp_avg.items(), key=lambda x: -x[1])[:top_n]
-    print(f"\n  Top {top_n} features (trung binh 55 model):")
+    print(f"\n  Top {top_n} features (trung binh 35 model):")
     for f, s in top:
         print(f"    {f:<44} {s:.4f}  {'█' * int(s * 500)}")
 
@@ -624,11 +678,14 @@ def _show_top_importance(results: dict, top_n: int = 15):
 # ─────────────────────────────────────────────
 
 ENSEMBLE_CONFIGS = [
-    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "xgb",  "xgb_params": {"max_depth": 3},                     "label": "M1(xgb,d3,lag3,all)"},
-    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "xgb",  "xgb_params": {"max_depth": 5, "n_estimators": 500}, "label": "M2(xgb,d5,n500,lag3,all)"},
-    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "lgbm", "xgb_params": {},                                    "label": "M3(lgbm,lag3,all)"},
-    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "lgbm", "xgb_params": {"max_depth": 5, "n_estimators": 500}, "label": "M4(lgbm,d5,n500,lag3,all)"},
-    {"lags": 3, "decay": 0.990, "train_window": 300, "model_type": "xgb",  "xgb_params": {"max_depth": 3, "n_estimators": 500}, "label": "M5(xgb,d3,n500,w300)"},
+    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "xgb",      "xgb_params": {"max_depth": 3},                     "label": "M1(xgb,d3,lag3,all)"},
+    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "xgb",      "xgb_params": {"max_depth": 5, "n_estimators": 500}, "label": "M2(xgb,d5,n500,lag3,all)"},
+    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "lgbm",     "xgb_params": {},                                    "label": "M3(lgbm,lag3,all)"},
+    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "lgbm",     "xgb_params": {"max_depth": 5, "n_estimators": 500}, "label": "M4(lgbm,d5,n500,lag3,all)"},
+    {"lags": 3, "decay": 0.990, "train_window": 300, "model_type": "xgb",      "xgb_params": {"max_depth": 3, "n_estimators": 500}, "label": "M5(xgb,d3,n500,w300)"},
+    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "catboost", "xgb_params": {},                                    "label": "M6(catboost,d3,lag3,all)"},
+    {"lags": 3, "decay": 0.990, "train_window": 300, "model_type": "catboost", "xgb_params": {"depth": 5, "iterations": 500},       "label": "M7(catboost,d5,n500,w300)"},
+    {"lags": 3, "decay": 0.995, "train_window": 0,   "model_type": "catboost", "xgb_params": {"depth": 5, "iterations": 500},       "label": "M8(catboost,d5,n500,lag3,all)"},
 ]
 
 
@@ -654,11 +711,6 @@ def train_ensemble(df: pd.DataFrame,
 
 
 def _ensemble_weights(all_results: list, baseline: float) -> np.ndarray:
-    """
-    Softmax weight theo mean CV precision.
-    Config co beat_ratio < ENSEMBLE_MIN_BEAT_RATIO → weight = 0.
-    Neu tat ca bi loai → giu config co beat_ratio cao nhat.
-    """
     weights = []
     for r in all_results:
         precs      = [r[n]["prec"] for n in ALL_NUMS]
@@ -761,9 +813,9 @@ def show_prediction(df: pd.DataFrame, proba: list, top_k: int = 8):
     print(f"\n{'═'*62}")
     print(f"📌 Input  : ky {last_ky}")
     print(f"🎯 Du doan cho ky {int(last_ky) + 1}:")
-    print(f"  Baseline (hypergeometric): {baseline:.4f} ({baseline:.1%})")
+    print(f"  Baseline (hypergeometric 5/35): {baseline:.4f} ({baseline:.1%})")
     print(f"{'═'*62}")
-    print(f"\n  📌 Top {top_k} so chinh (N1-N6):")
+    print(f"\n  📌 Top {top_k} so chinh (N1-N5):")
 
     nums = []
     for rank, (num, prob, cvp) in enumerate(top, 1):
@@ -777,7 +829,7 @@ def show_prediction(df: pd.DataFrame, proba: list, top_k: int = 8):
     print(f"\n  → Chon    : {sorted(nums)}")
     print(f"  → Chan/Le : {n_even}C / {top_k - n_even}L")
     print(f"  → Chuc    : " + "  ".join(
-        f"{d*10}x:{dec_cnt.get(d, 0)}" for d in range(6) if dec_cnt.get(d, 0) > 0
+        f"{d*10}x:{dec_cnt.get(d, 0)}" for d in range(4) if dec_cnt.get(d, 0) > 0
     ))
     print(f"{'═'*62}\n")
     return nums
@@ -809,10 +861,10 @@ def save_predict(args, df: pd.DataFrame, proba: list, cv_prec: float):
             row[f"n{i}"] = row[f"p{i}"] = row[f"cvp{i}"] = None
 
     sql = """
-    INSERT INTO public.p655kqpredict (
+    INSERT INTO public.l535kqpredict (
         run_at, version, description,
         source, lags, train_window, decay, top_k, score_mode,
-        cv_prec_n16, input_ky, predict_ky,
+        cv_prec_mean, input_ky, predict_ky,
         n1,p1,cvp1, n2,p2,cvp2, n3,p3,cvp3, n4,p4,cvp4,
         n5,p5,cvp5, n6,p6,cvp6, n7,p7,cvp7, n8,p8,cvp8,
         n9,p9,cvp9, n10,p10,cvp10, n11,p11,cvp11, n12,p12,cvp12,
@@ -821,7 +873,7 @@ def save_predict(args, df: pd.DataFrame, proba: list, cv_prec: float):
     ) VALUES (
         %(run_at)s, %(version)s, %(description)s,
         %(source)s, %(lags)s, %(train_window)s, %(decay)s,
-        %(top_k)s, %(score_mode)s, %(cv_prec_n16)s,
+        %(top_k)s, %(score_mode)s, %(cv_prec_mean)s,
         %(input_ky)s, %(predict_ky)s,
         %(n1)s,%(p1)s,%(cvp1)s, %(n2)s,%(p2)s,%(cvp2)s,
         %(n3)s,%(p3)s,%(cvp3)s, %(n4)s,%(p4)s,%(cvp4)s,
@@ -837,7 +889,7 @@ def save_predict(args, df: pd.DataFrame, proba: list, cv_prec: float):
         run_at=EXCLUDED.run_at, description=EXCLUDED.description,
         source=EXCLUDED.source, lags=EXCLUDED.lags,
         train_window=EXCLUDED.train_window, decay=EXCLUDED.decay,
-        top_k=EXCLUDED.top_k, cv_prec_n16=EXCLUDED.cv_prec_n16,
+        top_k=EXCLUDED.top_k, cv_prec_mean=EXCLUDED.cv_prec_mean,
         input_ky=EXCLUDED.input_ky,
         n1=EXCLUDED.n1,p1=EXCLUDED.p1,cvp1=EXCLUDED.cvp1,
         n2=EXCLUDED.n2,p2=EXCLUDED.p2,cvp2=EXCLUDED.cvp2,
@@ -868,7 +920,7 @@ def save_predict(args, df: pd.DataFrame, proba: list, cv_prec: float):
         "decay": getattr(args, "decay", 0.995),
         "top_k": getattr(args, "top", 8),
         "score_mode": score_mode,
-        "cv_prec_n16": float(cv_prec),
+        "cv_prec_mean": float(cv_prec),
         "input_ky": input_ky, "predict_ky": predict_ky,
         **row,
     }
@@ -878,7 +930,7 @@ def save_predict(args, df: pd.DataFrame, proba: list, cv_prec: float):
     try:
         cur.execute(sql, params)
         conn.commit()
-        print(f"\n💾 Saved → p655kqpredict"
+        print(f"\n💾 Saved → l535kqpredict"
               f"  (input_ky={input_ky}, predict_ky={predict_ky},"
               f"  version={VERSION}, mode={score_mode})")
     except Exception as e:
@@ -903,7 +955,7 @@ def update_result():
     try:
         cur.execute("""
             SELECT id, predict_ky, top_k, n1,n2,n3,n4,n5,n6,n7,n8
-            FROM public.p655kqpredict
+            FROM public.l535kqpredict
             WHERE actual_n1 IS NULL AND predict_ky IS NOT NULL
             ORDER BY predict_ky
         """)
@@ -914,8 +966,9 @@ def update_result():
 
         for row in pending:
             predict_ky = str(row["predict_ky"] or "").strip()
+            # Chi lay N1-N5 (so chinh) de doi chieu
             cur.execute("""
-                SELECT n1,n2,n3,n4,n5,n6 FROM public.p655kqdetail
+                SELECT n1,n2,n3,n4,n5 FROM public.l535kqdetail
                 WHERE ky = %s LIMIT 1
             """, (predict_ky,))
             actual = cur.fetchone()
@@ -925,26 +978,28 @@ def update_result():
 
             actual_nums = {
                 int(actual[f"n{i}"])
-                for i in range(1, 7)
+                for i in range(1, 6)   # chi N1-N5
                 if actual[f"n{i}"] is not None and actual[f"n{i}"] != 0
             }
             top_k     = int(row["top_k"] or 8)
             pred_nums = [int(row[f"n{i}"]) for i in range(1, 19)
-                         if row.get(f"n{i}") is not None and len([x for x in [row.get(f"n{j}") for j in range(1, i)] if x is not None]) < top_k][:top_k]
+                         if row.get(f"n{i}") is not None
+                         and len([x for x in [row.get(f"n{j}") for j in range(1, i)]
+                                  if x is not None]) < top_k][:top_k]
 
             hits     = set(pred_nums) & actual_nums
             hit_cnt  = len(hits)
             prec_val = hit_cnt / top_k if top_k > 0 else 0.0
 
             cur.execute("""
-                UPDATE public.p655kqpredict SET
+                UPDATE public.l535kqpredict SET
                     actual_n1=%(an1)s, actual_n2=%(an2)s, actual_n3=%(an3)s,
                     actual_n4=%(an4)s, actual_n5=%(an5)s, actual_n6=%(an6)s,
                     hit_cnt=%(hit_cnt)s, precision_val=%(prec)s, updated_at=%(upd)s
                 WHERE id=%(id)s
             """, {
                 "an1": actual["n1"], "an2": actual["n2"], "an3": actual["n3"],
-                "an4": actual["n4"], "an5": actual["n5"], "an6": actual["n6"],
+                "an4": actual["n4"], "an5": actual["n5"], "an6": None,  # so phu khong predict
                 "hit_cnt": hit_cnt, "prec": prec_val,
                 "upd": datetime.now(timezone.utc), "id": row["id"],
             })
@@ -969,16 +1024,16 @@ def update_result():
 # ─────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="XGBoost predict P655 v1.2.0")
+    parser = argparse.ArgumentParser(description="XGBoost predict L535 v1.0.0")
     parser.add_argument("--update_result", action="store_true")
     parser.add_argument("--source",        choices=["db", "csv"], default="db")
-    parser.add_argument("--file",          default="p655kqdetail.csv")
+    parser.add_argument("--file",          default="l535kqdetail.csv")
     parser.add_argument("--n_ky",          type=int,   default=0)
     parser.add_argument("--qh_ky",         type=int,   default=20)
     parser.add_argument("--lags",          type=int,   default=3)
     parser.add_argument("--top",           type=int,   default=8)
     parser.add_argument("--val_size",      type=int,   default=50)
-    parser.add_argument("--min_train",     type=int,   default=300)
+    parser.add_argument("--min_train",     type=int,   default=400)
     parser.add_argument("--train_window",  type=int,   default=0)
     parser.add_argument("--decay",         type=float, default=0.995)
     parser.add_argument("--importance",    action="store_true")
@@ -1009,19 +1064,20 @@ def main():
     df = (load_from_csv(args.file) if args.source == "csv"
           else load_from_db(args.n_ky, args.qh_ky))
     print(f"   {len(df)} ky")
-    print(f"   Mega : {'✅' if 'mgn1' in df.columns else '⚠️'}")
-    print(f"   JP   : {'✅' if 'jpck' in df.columns else '⚠️'}")
-    print(f"   QHL  : {'✅' if 'qhl'  in df.columns else '⚠️'}")
+    print(f"   Mega  : {'✅' if 'mgn1' in df.columns else '⚠️'}")
+    print(f"   JP    : {'✅' if 'jpck' in df.columns else '⚠️'}")
+    print(f"   QHL   : {'✅' if 'qhl'  in df.columns else '⚠️'}")
+    print(f"   Power : {'✅' if 'pwn1' in df.columns else '⚠️'}")
 
-    print("\n⚙️  Precomputing hit matrix & co-occurrence matrix...")
+    print("\n⚙️  Precomputing hit matrix & co-occurrence matrix (N1-N5 only)...")
     hit_mat = build_hit_matrix(df)
     co_mat  = build_cooccurrence_matrix(hit_mat)
     print(f"   hit_mat: {hit_mat.shape}  co_mat: {co_mat.shape}")
     baseline = hypergeometric_baseline(top_k=args.top)
-    print(f"   Baseline (hypergeometric, top={args.top}): {baseline:.4f} ({baseline:.1%})")
+    print(f"   Baseline (hypergeometric 5/35, top={args.top}): {baseline:.4f} ({baseline:.1%})")
 
     if args.ensemble:
-        print(f"\n🚀 Training ensemble ({len(ENSEMBLE_CONFIGS)} configs × 55 so)...")
+        print(f"\n🚀 Training ensemble ({len(ENSEMBLE_CONFIGS)} configs × 35 so)...")
         all_results = train_ensemble(df, hit_mat, co_mat,
                                      val_size=args.val_size, min_train=args.min_train)
         print(f"\n🔮 Predicting (ensemble, weighted by CV prec)...")
@@ -1032,7 +1088,7 @@ def main():
         print("\n⚙️  Global feature engineering...")
         global_feat = make_global_features(df, lags=args.lags)
         print(f"   {global_feat.shape[1]} global features")
-        print(f"\n🚀 Training 55 model (top={args.top})...")
+        print(f"\n🚀 Training 35 model (top={args.top})...")
         results = train_all(
             df, global_feat, hit_mat, co_mat,
             lags=args.lags, val_size=args.val_size, min_train=args.min_train,
